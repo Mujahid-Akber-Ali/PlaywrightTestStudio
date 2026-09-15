@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationDefaultFont>Segoe UI, 9pt</ApplicationDefaultFont>
+    <RootNamespace>PlaywrightTestStudio</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Playwright" Version="1.55.0" />
+  </ItemGroup>
+
+  <!--
+    GeneratedTests\ holds the .cs file this tool writes for every link. Those
+    files target a separate NUnit test project, so they are shipped as content
+    and deliberately kept out of this app's compilation.
+  -->
+  <ItemGroup>
+    <Compile Remove="GeneratedTests\**" />
+    <None Include="GeneratedTests\**" />
+  </ItemGroup>
+
+</Project>
