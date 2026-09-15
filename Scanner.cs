@@ -56,6 +56,7 @@ internal static class Scanner
                 Selector = Str(item, "selector"),
                 Name = Str(item, "name"),
                 Value = Str(item, "value"),
+                ResultsSelector = Str(item, "resultsSelector"),
                 Visible = Bool(item, "visible"),
                 Required = Bool(item, "required"),
                 Options = StrList(item, "options"),
@@ -73,6 +74,7 @@ internal static class Scanner
         var rank = new Dictionary<string, int>
         {
             ["text"] = 0,
+            ["search"] = 0,
             ["select"] = 0,
             ["radio"] = 0,
             ["checkbox"] = 0,
@@ -191,6 +193,45 @@ internal static class Scanner
         return clean(el.name || el.id || '');
       };
 
+      // Widget libraries that turn a plain input into a search-and-pick box.
+      const WIDGET_HINT = /select2|chosen|typeahead|tt-input|autocomplete|combobox|lookup|suggest|token-input/i;
+
+      // A name or id that reads like an item lookup rather than a plain field.
+      const NAME_HINT = /search|lookup|find|suggest|autocomplete|typeahead/i;
+
+      // Where a type-ahead says its results will appear.
+      const resultsFor = (el) => {
+        for (const attr of ['aria-owns', 'aria-controls']) {
+          const id = el.getAttribute(attr);
+          if (id && document.getElementById(id)) return '#' + esc(id);
+        }
+        const list = el.getAttribute('list');
+        if (list && document.getElementById(list)) return '#' + esc(list);
+        return '';
+      };
+
+      // True for a field you type into and then pick a result from, rather than
+      // one you simply fill in.
+      const isTypeahead = (el) => {
+        const t = String(el.type || 'text').toLowerCase();
+        if (t !== 'text' && t !== 'search') return false;
+        if (t === 'search') return true;
+
+        const role = String(el.getAttribute('role') || '').toLowerCase();
+        if (role === 'combobox' || role === 'searchbox') return true;
+
+        if (el.hasAttribute('aria-autocomplete')) return true;
+        if (el.hasAttribute('list')) return true;
+        if (el.getAttribute('aria-owns') || el.getAttribute('aria-controls')) return true;
+
+        const classes = String(el.className || '') + ' ' +
+                        String(el.parentElement ? el.parentElement.className : '') + ' ' +
+                        String(el.parentElement && el.parentElement.parentElement ? el.parentElement.parentElement.className : '');
+        if (WIDGET_HINT.test(classes)) return true;
+
+        return NAME_HINT.test(String(el.name || '') + ' ' + String(el.id || ''));
+      };
+
       const isVisible = (el) => {
         const r = el.getBoundingClientRect();
         const st = window.getComputedStyle(el);
@@ -218,6 +259,7 @@ internal static class Scanner
           label: labelFor(el),
           visible: isVisible(el),
           required: !!el.required,
+          resultsSelector: '',
           options: [],
           optionValues: []
         };
@@ -242,6 +284,19 @@ internal static class Scanner
           push(el, 'button', { label: clean(el.value || el.getAttribute('aria-label') || el.title || t) });
           return;
         }
+
+        if (isTypeahead(el)) {
+          const listId = el.getAttribute('list');
+          const datalist = listId ? document.getElementById(listId) : null;
+
+          push(el, 'search', {
+            resultsSelector: resultsFor(el),
+            options: datalist ? Array.prototype.map.call(datalist.options, o => clean(o.label || o.value)) : [],
+            optionValues: datalist ? Array.prototype.map.call(datalist.options, o => String(o.value)) : []
+          });
+          return;
+        }
+
         push(el, 'text', {});
       });
 

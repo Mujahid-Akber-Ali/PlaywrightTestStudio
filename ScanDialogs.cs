@@ -22,6 +22,7 @@ internal static class ScanDialogs
         {
             $"{elements.Count(e => e.Kind == "select")} dropdown(s)",
             $"{elements.Count(e => e.Kind == "text")} text field(s)",
+            $"{elements.Count(e => e.Kind == "search")} search field(s)",
             $"{elements.Count(e => e.Kind == "radio")} radio button(s)",
             $"{elements.Count(e => e.Kind == "checkbox")} checkbox(es)",
             $"{elements.Count(e => e.Kind == "button")} button(s)"
@@ -52,6 +53,9 @@ internal static class ScanDialogs
             {
                 "select" => string.Join(" | ", element.Options.Take(6)) +
                             (element.Options.Count > 6 ? $" ... (+{element.Options.Count - 6})" : ""),
+                "search" => element.ResultsSelector.Length > 0
+                    ? $"type, wait, then pick from {element.ResultsSelector}"
+                    : "type, wait for the search, then pick a result",
                 "radio" => $"group \"{element.Name}\", value \"{element.Value}\"",
                 "checkbox" => $"value \"{element.Value}\"",
                 _ => element.InputType
@@ -124,15 +128,17 @@ internal static class ScanDialogs
 
         form.Controls.Add(Ui.Title("Enter the data for this test"));
         form.Controls.Add(Ui.Hint(
-            "Tick the fields this test should fill, then set each value. " +
-            "Below, tick the buttons to press and put them in the order they should be clicked.",
+            "Tick the fields to fill, then set each value. A \"search\" field is typed into, waits for the page " +
+            "to search, then picks the result you name - use the Type column to switch a field between text and " +
+            "search. Below, tick the buttons to press, in order.",
             22, 46, 890));
 
         var fieldGrid = Ui.NewGrid(20, 84, 896, 300);
         fieldGrid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Use", HeaderText = "Use", Width = 44 });
-        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Type", HeaderText = "Type", Width = 80, ReadOnly = true });
-        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Field", HeaderText = "Field", Width = 240, ReadOnly = true });
-        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Value", HeaderText = "Value to enter", Width = 220 });
+        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Type", HeaderText = "Type", Width = 90 });
+        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Field", HeaderText = "Field", Width = 210, ReadOnly = true });
+        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Value", HeaderText = "Value / text to search for", Width = 180 });
+        fieldGrid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Pick", HeaderText = "Then pick this result", Width = 160 });
         fieldGrid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "Selector",
@@ -144,6 +150,24 @@ internal static class ScanDialogs
         // A combo cell rejects a value that is not in its item list; swallowing
         // the complaint keeps a stale saved value from blocking the dialog.
         fieldGrid.DataError += (_, e) => e.ThrowException = false;
+
+        // Commit a tick or a dropdown choice as soon as it is made, so the row
+        // can react to it rather than waiting for focus to move away.
+        fieldGrid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (fieldGrid.IsCurrentCellDirty)
+            {
+                fieldGrid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+        };
+
+        fieldGrid.CellValueChanged += (_, e) =>
+        {
+            if (e.RowIndex >= 0 && e.ColumnIndex == fieldGrid.Columns["Type"]!.Index)
+            {
+                SyncSearchRow(fieldGrid.Rows[e.RowIndex]);
+            }
+        };
 
         BuildFieldRows(fieldGrid, elements, existing);
 
@@ -259,7 +283,7 @@ internal static class ScanDialogs
         var label = group.FirstOrDefault(e => e.Label.Length > 0)?.Label ?? groupName;
         var saved = existing?.Fields.FirstOrDefault(f => f.Kind == "radio" && f.Group == groupName);
 
-        var index = grid.Rows.Add(saved?.Use ?? false, "radio", $"{label}  ({groupName})", "", "");
+        var index = grid.Rows.Add(saved?.Use ?? false, "radio", $"{label}  ({groupName})", "", "", "");
         var row = grid.Rows[index];
 
         var options = group.Select(OptionLabel).ToList();
@@ -268,6 +292,7 @@ internal static class ScanDialogs
         row.Cells["Value"] = cell;
         row.Cells["Selector"].Value = saved?.Selector ?? group[0].Selector;
         row.Cells["Selector"].Style.Font = Ui.Mono;
+        row.Cells["Type"].ReadOnly = true;
 
         row.Tag = new FieldRow
         {
@@ -283,13 +308,28 @@ internal static class ScanDialogs
     {
         var saved = existing?.Fields.FirstOrDefault(f => f.Selector == element.Selector);
 
-        var index = grid.Rows.Add(saved?.Use ?? element.Visible, KindLabel(element.Kind),
-            element.Display, "", element.Selector);
+        // A saved case wins over the scan: the operator may already have
+        // corrected a field the scanner read as plain text.
+        var kind = saved?.Kind ?? element.Kind;
+
+        var index = grid.Rows.Add(saved?.Use ?? element.Visible, KindLabel(kind),
+            element.Display, "", saved?.Pick ?? "", element.Selector);
 
         var row = grid.Rows[index];
         row.Cells["Selector"].Style.Font = Ui.Mono;
 
-        switch (element.Kind)
+        // Only a typed field is ambiguous, so only those get the choice; a
+        // dropdown, radio or checkbox is what it is.
+        if (kind is "text" or "search")
+        {
+            row.Cells["Type"] = NewComboCell(new[] { "text", "search" }, kind);
+        }
+        else
+        {
+            row.Cells["Type"].ReadOnly = true;
+        }
+
+        switch (kind)
         {
             case "select":
             {
@@ -326,11 +366,39 @@ internal static class ScanDialogs
 
         row.Tag = new FieldRow
         {
-            Kind = element.Kind,
+            Kind = kind,
             Label = element.Display,
             Selector = element.Selector,
-            Group = element.Name
+            Group = element.Name,
+            ResultsSelector = saved?.ResultsSelector is { Length: > 0 } saveds
+                ? saveds
+                : element.ResultsSelector
         };
+
+        SyncSearchRow(row);
+    }
+
+    /// <summary>
+    /// "Then pick" only means something for a search field, so it is greyed out
+    /// and locked on every other row - including when the operator switches a
+    /// row's type back to plain text.
+    /// </summary>
+    private static void SyncSearchRow(DataGridViewRow row)
+    {
+        var isSearch = (row.Cells["Type"].Value?.ToString() ?? "") == "search";
+        var pick = row.Cells["Pick"];
+
+        pick.ReadOnly = !isSearch;
+        pick.Style.BackColor = isSearch ? Color.White : SystemColors.Control;
+        pick.Style.ForeColor = isSearch ? SystemColors.ControlText : Ui.Muted;
+
+        pick.ToolTipText = isSearch
+            ? "The result to click once the page has searched. Leave empty to take the first result."
+            : "Only used by search fields.";
+
+        row.Cells["Value"].ToolTipText = isSearch
+            ? "Typed into the field one key at a time to start the search."
+            : "";
     }
 
     private static void BuildClickRows(DataGridView grid, IReadOnlyList<ElementInfo> elements, TestCase? existing)
@@ -408,8 +476,14 @@ internal static class ScanDialogs
             var value = row.Cells["Value"].Value?.ToString() ?? "";
             var selector = context.Selector;
 
+            // Only a typed field carries a choice of kind; everything else is
+            // fixed, so fall back to what the scan decided.
+            var kind = context.Kind is "text" or "search"
+                ? row.Cells["Type"].Value?.ToString() ?? context.Kind
+                : context.Kind;
+
             // For a radio group the picked option decides which input is checked.
-            if (context.Kind == "radio" && context.Options is not null)
+            if (kind == "radio" && context.Options is not null)
             {
                 var picked = context.Options.FirstOrDefault(o => OptionLabel(o) == value) ?? context.Options[0];
                 selector = picked.Selector;
@@ -418,10 +492,12 @@ internal static class ScanDialogs
             list.Add(new FieldValue
             {
                 Use = true,
-                Kind = context.Kind,
+                Kind = kind,
                 Label = context.Label,
                 Selector = selector,
                 Value = value,
+                Pick = kind == "search" ? row.Cells["Pick"].Value?.ToString()?.Trim() ?? "" : "",
+                ResultsSelector = kind == "search" ? context.ResultsSelector : "",
                 Group = context.Group
             });
         }
@@ -502,6 +578,7 @@ internal static class ScanDialogs
     {
         "select" => "dropdown",
         "text" => "text",
+        "search" => "search",
         "radio" => "radio",
         "checkbox" => "checkbox",
         "button" => "button",
@@ -515,6 +592,9 @@ internal static class ScanDialogs
         public string Label { get; init; } = "";
         public string Selector { get; init; } = "";
         public string Group { get; init; } = "";
+
+        /// <summary>Where this field's search results appear, when the page says so.</summary>
+        public string ResultsSelector { get; init; } = "";
 
         /// <summary>Set only for a radio group: the inputs the pick list maps to.</summary>
         public List<ElementInfo>? Options { get; init; }

@@ -9,11 +9,18 @@ namespace PlaywrightTestStudio;
 /// </summary>
 internal sealed class ElementInfo
 {
-    /// <summary>text | select | radio | checkbox | button</summary>
+    /// <summary>text | search | select | radio | checkbox | button</summary>
     public string Kind { get; set; } = "text";
 
     public string Tag { get; set; } = "";
     public string InputType { get; set; } = "";
+
+    /// <summary>
+    /// For a search / type-ahead field: where its results appear, when the page
+    /// says so through aria-owns, aria-controls or a datalist. Empty means the
+    /// runner falls back to the usual suggestion containers.
+    /// </summary>
+    public string ResultsSelector { get; set; } = "";
 
     /// <summary>Human label: &lt;label for&gt;, wrapping label, aria-label, placeholder or name.</summary>
     public string Label { get; set; } = "";
@@ -39,14 +46,26 @@ internal sealed class FieldValue
 {
     public bool Use { get; set; } = true;
 
-    /// <summary>text | select | radio | checkbox</summary>
+    /// <summary>text | search | select | radio | checkbox</summary>
     public string Kind { get; set; } = "text";
 
     public string Label { get; set; } = "";
     public string Selector { get; set; } = "";
 
-    /// <summary>Typed text, option label, or "true"/"false" for a checkbox.</summary>
+    /// <summary>
+    /// Typed text, option label, or "true"/"false" for a checkbox. For a search
+    /// field this is what gets typed to start the search.
+    /// </summary>
     public string Value { get; set; } = "";
+
+    /// <summary>
+    /// Search fields only: the result to click once the suggestions appear.
+    /// Empty means take the first result the page offers.
+    /// </summary>
+    public string Pick { get; set; } = "";
+
+    /// <summary>Search fields only: where the suggestions appear, if known.</summary>
+    public string ResultsSelector { get; set; } = "";
 
     /// <summary>Radio group name, so the report can say which group was answered.</summary>
     public string Group { get; set; } = "";

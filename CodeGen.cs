@@ -84,9 +84,16 @@ internal static class CodeGen
             sb.AppendLine();
             sb.AppendLine("        // Data entered on the form");
 
+            // Search fields declare a local, so the names have to be unique
+            // within the method even when two boxes carry the same label.
+            var locals = new HashSet<string>(StringComparer.Ordinal);
+
             foreach (var field in fields)
             {
-                sb.AppendLine($"        {FieldStatement(field)}   // {Comment(field.Label)}");
+                foreach (var line in FieldStatements(field, UniqueLocal(locals, SearchVariable(field))))
+                {
+                    sb.AppendLine($"        {line}");
+                }
             }
         }
 
@@ -127,18 +134,91 @@ internal static class CodeGen
         sb.AppendLine("    }");
     }
 
-    private static string FieldStatement(FieldValue field) => field.Kind switch
+    private static IEnumerable<string> FieldStatements(FieldValue field, string searchVar)
     {
-        "select" => $"await Page.SelectOptionAsync({Literal(field.Selector)}, " +
-                    $"new SelectOptionValue {{ Label = {Literal(field.Value)} }});",
+        var note = $"   // {Comment(field.Label)}";
 
-        "radio" => $"await Page.CheckAsync({Literal(field.Selector)});",
+        switch (field.Kind)
+        {
+            case "select":
+                yield return $"await Page.SelectOptionAsync({Literal(field.Selector)}, " +
+                             $"new SelectOptionValue {{ Label = {Literal(field.Value)} }});{note}";
+                break;
 
-        "checkbox" => $"await Page.SetCheckedAsync({Literal(field.Selector)}, " +
-                      $"{(Runner.IsTruthy(field.Value) ? "true" : "false")});",
+            case "search":
+            {
+                // Typed key by key, because lookup widgets search on key events
+                // and ignore a value that is simply assigned.
+                yield return $"var {searchVar} = Page.Locator({Literal(field.Selector)}).First;{note}";
+                yield return $"await {searchVar}.ClickAsync();";
+                yield return $"await {searchVar}.PressSequentiallyAsync({Literal(field.Value)}, " +
+                             "new LocatorPressSequentiallyOptions { Delay = 60 });";
 
-        _ => $"await Page.FillAsync({Literal(field.Selector)}, {Literal(field.Value)});"
-    };
+                var pick = field.Pick.Trim();
+
+                if (pick.Length == 0)
+                {
+                    yield return "await Page.GetByRole(AriaRole.Option).First";
+                    yield return "    .ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
+                }
+                else if (field.ResultsSelector.Trim().Length > 0)
+                {
+                    var scope = field.ResultsSelector.Trim();
+
+                    yield return $"await Page.Locator({Literal($"{scope} [role=option], {scope} li, {scope} option")})";
+                    yield return $"    .Filter(new LocatorFilterOptions {{ HasTextString = {Literal(pick)} }})";
+                    yield return "    .First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
+                }
+                else
+                {
+                    yield return $"await Page.GetByRole(AriaRole.Option, new PageGetByRoleOptions {{ Name = {Literal(pick)} }})";
+                    yield return "    .First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
+                }
+
+                break;
+            }
+
+            case "radio":
+                yield return $"await Page.CheckAsync({Literal(field.Selector)});{note}";
+                break;
+
+            case "checkbox":
+                yield return $"await Page.SetCheckedAsync({Literal(field.Selector)}, " +
+                             $"{(Runner.IsTruthy(field.Value) ? "true" : "false")});{note}";
+                break;
+
+            default:
+                yield return $"await Page.FillAsync({Literal(field.Selector)}, {Literal(field.Value)});{note}";
+                break;
+        }
+    }
+
+    /// <summary>Makes a local name unique within the method being written.</summary>
+    private static string UniqueLocal(HashSet<string> used, string name)
+    {
+        var candidate = name;
+        var n = 2;
+
+        while (!used.Add(candidate))
+        {
+            candidate = $"{name}{n++}";
+        }
+
+        return candidate;
+    }
+
+    /// <summary>A readable local name for the search box a step is driving.</summary>
+    private static string SearchVariable(FieldValue field)
+    {
+        var name = Storage.Identifier(field.Label.Length > 0 ? field.Label : "search");
+
+        if (name.Length > 24)
+        {
+            name = name[..24];
+        }
+
+        return char.ToLowerInvariant(name[0]) + name[1..] + "Search";
+    }
 
     private static IEnumerable<string> AssertionStatements(AssertionSpec spec)
     {

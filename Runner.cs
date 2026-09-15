@@ -158,6 +158,10 @@ internal static class Runner
                 await SelectOptionAsync(page, field);
                 break;
 
+            case "search":
+                await SearchAndPickAsync(page, field);
+                break;
+
             case "radio":
                 await page.CheckAsync(field.Selector);
                 break;
@@ -178,6 +182,17 @@ internal static class Runner
     /// </summary>
     private static async Task SelectOptionAsync(IPage page, FieldValue field)
     {
+        var locator = page.Locator(field.Selector).First;
+
+        // Widgets like select2 and chosen hide the real <select> and draw their
+        // own box over it. Playwright cannot click what is hidden, so set the
+        // value in the DOM and raise the events the page is listening for.
+        if (!await locator.IsVisibleAsync())
+        {
+            await SetHiddenSelectAsync(locator, field.Value);
+            return;
+        }
+
         try
         {
             await page.SelectOptionAsync(field.Selector, new SelectOptionValue { Label = field.Value });
@@ -185,6 +200,144 @@ internal static class Runner
         catch (PlaywrightException)
         {
             await page.SelectOptionAsync(field.Selector, new SelectOptionValue { Value = field.Value });
+        }
+    }
+
+    private static async Task SetHiddenSelectAsync(ILocator select, string wanted)
+    {
+        await select.EvaluateAsync("""
+        (el, wanted) => {
+          const text = String(wanted).trim().toLowerCase();
+          const options = Array.prototype.slice.call(el.options);
+
+          const match = options.find(o => o.text.trim().toLowerCase() === text)
+                     || options.find(o => String(o.value).toLowerCase() === text)
+                     || options.find(o => o.text.trim().toLowerCase().indexOf(text) >= 0);
+
+          if (!match) {
+            throw new Error('No option matching "' + wanted + '". Options: ' +
+              options.map(o => o.text.trim()).join(' | '));
+          }
+
+          el.value = match.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+
+          // Enhanced widgets usually redraw on a jQuery change.
+          if (window.jQuery) { window.jQuery(el).trigger('change'); }
+        }
+        """, wanted);
+    }
+
+    /// <summary>
+    /// Drives a type-ahead the way a person does: type into it, wait for the
+    /// search to come back, then click the result. Keystrokes are sent one at a
+    /// time because most lookup widgets listen for key events and ignore a
+    /// value that is simply assigned.
+    /// </summary>
+    private static async Task SearchAndPickAsync(IPage page, FieldValue field)
+    {
+        var input = page.Locator(field.Selector).First;
+
+        await input.ClickAsync();
+
+        try
+        {
+            await input.FillAsync("");
+        }
+        catch (PlaywrightException)
+        {
+            // Some widgets refuse an empty fill; typing over the top is fine.
+        }
+
+        await input.PressSequentiallyAsync(field.Value, new LocatorPressSequentiallyOptions { Delay = 60 });
+
+        var wanted = field.Pick.Trim().Length > 0 ? field.Pick.Trim() : "";
+
+        foreach (var (candidate, timeout) in ResultCandidates(page, field, wanted))
+        {
+            try
+            {
+                await candidate.First.ClickAsync(new LocatorClickOptions { Timeout = timeout });
+                return;
+            }
+            catch (TimeoutException)
+            {
+                // Try the next shape of suggestion list.
+            }
+            catch (PlaywrightException)
+            {
+            }
+        }
+
+        if (wanted.Length == 0)
+        {
+            // No specific item was asked for and nothing clickable was found:
+            // most lookups still answer to the keyboard.
+            await input.PressAsync("ArrowDown");
+            await input.PressAsync("Enter");
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Typed \"{field.Value}\" into \"{field.Label}\" but no search result matching " +
+            $"\"{wanted}\" appeared.\r\n" +
+            "Check the wording of the item, or give the field longer to search.");
+    }
+
+    /// <summary>
+    /// The suggestion-list shapes worth trying, most specific first. The first
+    /// one gets the long timeout because that is the wait for the search itself;
+    /// by the time it gives up, the results are either there or never coming.
+    /// </summary>
+    private static IEnumerable<(ILocator Locator, float Timeout)> ResultCandidates(
+        IPage page, FieldValue field, string wanted)
+    {
+        var filter = wanted.Length > 0 ? new LocatorFilterOptions { HasTextString = wanted } : null;
+
+        ILocator Narrow(ILocator locator) => filter is null ? locator : locator.Filter(filter);
+
+        var container = field.ResultsSelector.Trim();
+        var first = true;
+
+        float Next()
+        {
+            var timeout = first ? 10_000f : 1_500f;
+            first = false;
+            return timeout;
+        }
+
+        if (container.Length > 0)
+        {
+            yield return (Narrow(page.Locator($"{container} [role=option], {container} li, {container} option")), Next());
+            yield return (Narrow(page.Locator($"{container} tr, {container} a, {container} div")), Next());
+        }
+
+        if (wanted.Length > 0)
+        {
+            yield return (page.GetByRole(AriaRole.Option, new PageGetByRoleOptions { Name = wanted }), Next());
+        }
+        else
+        {
+            yield return (page.GetByRole(AriaRole.Option), Next());
+        }
+
+        // The containers the common lookup widgets render into.
+        yield return (Narrow(page.Locator(
+            "[role=listbox] [role=option], " +
+            "ul.ui-autocomplete li, " +
+            ".select2-results__option, " +
+            ".tt-suggestion, " +
+            ".typeahead__item, " +
+            ".autocomplete-suggestion, " +
+            ".autocomplete-items div, " +
+            ".dropdown-menu li, " +
+            ".dropdown-menu a")), Next());
+
+        if (wanted.Length > 0)
+        {
+            // Last resort: anything visible on the page saying what we want.
+            yield return (page.GetByText(wanted), Next());
         }
     }
 

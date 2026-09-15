@@ -47,6 +47,13 @@ internal static class SelfTest
             Check("one dropdown found", elements.Count(e => e.Kind == "select") == 1);
             Check("two text fields found", elements.Count(e => e.Kind == "text") == 2,
                 $"got {elements.Count(e => e.Kind == "text")}");
+
+            var search = elements.FirstOrDefault(e => e.Kind == "search");
+            Check("the item lookup is read as a search field, not a text box or dropdown",
+                search is not null && search.Selector == "#itemSearch",
+                search?.Selector ?? "none found");
+            Check("the search field knows where its results appear",
+                search?.ResultsSelector == "#itemResults", search?.ResultsSelector ?? "");
             Check("two radio buttons found", elements.Count(e => e.Kind == "radio") == 2,
                 $"got {elements.Count(e => e.Kind == "radio")}");
             Check("one checkbox found", elements.Count(e => e.Kind == "checkbox") == 1);
@@ -72,7 +79,16 @@ internal static class SelfTest
                     new() { Kind = "text", Selector = "#username", Value = "saif", Label = "User name" },
                     new() { Kind = "select", Selector = "#role", Value = "Manager", Label = "Role" },
                     new() { Kind = "radio", Selector = pro.Selector, Value = pro.Label, Group = "plan", Label = "Plan" },
-                    new() { Kind = "checkbox", Selector = "#terms", Value = "true", Label = "Terms" }
+                    new() { Kind = "checkbox", Selector = "#terms", Value = "true", Label = "Terms" },
+                    new()
+                    {
+                        Kind = "search",
+                        Selector = "#itemSearch",
+                        Label = "Item",
+                        Value = "widget",
+                        Pick = "Widget clamp",
+                        ResultsSelector = search?.ResultsSelector ?? ""
+                    }
                 },
                 Clicks = new List<ClickStep>
                 {
@@ -80,7 +96,8 @@ internal static class SelfTest
                 },
                 Assertions = new List<AssertionSpec>
                 {
-                    new() { Kind = AssertionKinds.PageTextContains, Expected = "Submitted: saif / Manager / pro / true" },
+                    new() { Kind = AssertionKinds.PageTextContains, Expected = "Submitted: saif / Manager / pro / true / Widget clamp" },
+                    new() { Kind = AssertionKinds.ElementValueEquals, Selector = "#itemSearch", Expected = "Widget clamp" },
                     new() { Kind = AssertionKinds.ElementVisible, Selector = "#result" },
                     new() { Kind = AssertionKinds.ElementValueEquals, Selector = "#username", Expected = "saif" }
                 }
@@ -95,7 +112,7 @@ internal static class SelfTest
                 log.AppendLine($"              {(assertion.Passed ? "ok  " : "FAIL")} {assertion.Description}  actual: {assertion.Actual}");
             }
 
-            Check("the happy path run passes", result.IsPass, result.Message);
+            Check("the happy path run passes, type-ahead included", result.IsPass, result.Message);
             Check("a screenshot was captured", File.Exists(result.ScreenshotPath));
 
             // Now break one assertion and confirm the run reports Failed rather
@@ -116,12 +133,21 @@ internal static class SelfTest
             var code = File.ReadAllText(codeFile);
 
             log.AppendLine($"Code file   : {codeFile}");
+            log.AppendLine();
+            log.AppendLine("--- generated fixture ---");
+            log.AppendLine(code);
+            log.AppendLine("--- end ---");
+            log.AppendLine();
 
             Check("generated file fills the text field", code.Contains("Page.FillAsync(\"#username\", \"saif\")"));
             Check("generated file selects by label", code.Contains("SelectOptionAsync(\"#role\""));
             Check("generated file checks the radio", code.Contains("Page.CheckAsync("));
             Check("generated file sets the checkbox", code.Contains("SetCheckedAsync(\"#terms\", true)"));
             Check("generated file clicks the button", code.Contains("Page.ClickAsync(\"#submit\")"));
+            Check("generated file types into the search field key by key",
+                code.Contains("PressSequentiallyAsync(\"widget\""));
+            Check("generated file picks the search result",
+                code.Contains("Widget clamp") && code.Contains("ClickAsync(new LocatorClickOptions"));
             Check("generated file asserts", code.Contains("Assert.That(await Page.InnerTextAsync(\"body\")"));
             Check("generated file is a fixture", code.Contains("[TestFixture]") && code.Contains("[Test]"));
 
@@ -178,6 +204,11 @@ internal static class SelfTest
             <p><label><input type="radio" name="plan" value="basic"> Basic plan</label>
                <label><input type="radio" name="plan" value="pro"> Pro plan</label></p>
 
+            <p><label for="itemSearch">Item</label>
+               <input id="itemSearch" name="itemSearch" type="text" autocomplete="off"
+                      role="combobox" aria-autocomplete="list" aria-owns="itemResults">
+               <ul id="itemResults" role="listbox" style="display:none;list-style:none;margin:0;padding:0"></ul></p>
+
             <p><label for="terms">Accept terms</label>
                <input id="terms" name="terms" type="checkbox"></p>
 
@@ -187,6 +218,38 @@ internal static class SelfTest
           <div id="result" style="display:none"></div>
 
           <script>
+            // A type-ahead that only reacts to real keystrokes and answers
+            // after a delay, the way a server-backed item lookup does.
+            var catalogue = ['Blue widget', 'Red widget', 'Widget clamp', 'Bolt M8', 'Bolt M10'];
+            var searchBox = document.getElementById('itemSearch');
+            var results = document.getElementById('itemResults');
+            var chosenItem = '';
+            var pending = null;
+
+            searchBox.addEventListener('keyup', function () {
+              var term = searchBox.value.trim().toLowerCase();
+              chosenItem = '';
+              if (pending) { clearTimeout(pending); }
+              if (term.length < 2) { results.style.display = 'none'; return; }
+
+              pending = setTimeout(function () {
+                var hits = catalogue.filter(function (c) { return c.toLowerCase().indexOf(term) >= 0; });
+                results.innerHTML = '';
+                hits.forEach(function (hit) {
+                  var li = document.createElement('li');
+                  li.setAttribute('role', 'option');
+                  li.textContent = hit;
+                  li.addEventListener('click', function () {
+                    chosenItem = hit;
+                    searchBox.value = hit;
+                    results.style.display = 'none';
+                  });
+                  results.appendChild(li);
+                });
+                results.style.display = hits.length ? 'block' : 'none';
+              }, 400);
+            });
+
             document.getElementById('submit').addEventListener('click', function () {
               var plan = document.querySelector('input[name="plan"]:checked');
               var out = document.getElementById('result');
@@ -195,7 +258,8 @@ internal static class SelfTest
                 + document.getElementById('username').value + ' / '
                 + document.getElementById('role').selectedOptions[0].text + ' / '
                 + (plan ? plan.value : 'none') + ' / '
-                + document.getElementById('terms').checked;
+                + document.getElementById('terms').checked + ' / '
+                + (chosenItem || 'no item');
             });
           </script>
         </body>

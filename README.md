@@ -68,6 +68,33 @@ Assertions available: URL contains, page title contains, page text contains /
 does not contain, element is visible / not visible, element text contains,
 element value equals, element is enabled, element is checked.
 
+### Field types
+
+| Type | How the test drives it |
+|------|------------------------|
+| text | fills the value in |
+| search | types the value one key at a time, waits for the page to search, then clicks the result you named |
+| dropdown | selects by the option's visible label |
+| radio | checks the option you picked from the group |
+| checkbox | sets it to true or false |
+
+**Search fields** are the item-lookup boxes: you type, the page searches, a
+suggestion list appears and you pick from it. The scan marks a field as `search`
+when the page says so - `role="combobox"`, `aria-autocomplete`, `aria-owns` /
+`aria-controls`, a `<datalist>`, `type="search"`, a select2 / chosen / typeahead
+wrapper, or a name like `itemSearch`. The data popup then asks for two things:
+the **text to search for** and the **result to pick** (leave the pick empty to
+take the first result).
+
+Detection is a guess, so the **Type** column is editable: switch any typed field
+between `text` and `search` yourself. Keystrokes are sent one at a time because
+most lookup widgets search on key events and ignore a value that is simply
+assigned.
+
+Widgets that hide the real `<select>` and draw their own box over it (select2,
+chosen) are handled too: when the `<select>` is not visible the runner sets it in
+the DOM and fires `input`, `change` and a jQuery `change`.
+
 A run records Passed, Failed or Error, the per-assertion outcome with the actual
 value found, how long it took, and a full-page screenshot.
 
