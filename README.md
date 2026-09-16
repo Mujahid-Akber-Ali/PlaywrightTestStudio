@@ -20,9 +20,10 @@ uploads it back.
     +-- Record a test case
     |     |
     |     +-- "Which page?"                <- popup: the link (+ sign in first)
-    |     +-- Browser opens. You type, choose, tick and click.
+    |     +-- The app HIDES. Browser only. You type, choose, tick and click.
     |     |     Alt+click anything = record a CHECK on it, not a click.
-    |     +-- "Stop and save"
+    |     +-- Press Esc in the page to stop  (or close the browser)
+    |     +-- Name it                      <- popup
     |     +-- Review the steps             <- popup: untick strays, name columns
     |     +-- "What should this check?"    <- popup: name + assertions
     |     +-- Run  ->  PASSED / FAILED  ->  stored
@@ -52,9 +53,15 @@ The first browser action downloads Chromium for Playwright; that happens once.
 
 **Record a test case** opens the link in a real browser and watches it. Typing,
 dropdown choices, ticks, radio buttons, clicks and Enter are all captured, in
-order, as you go. A small window beside the browser counts the actions and shows
-the last one.
+order, as you go.
 
+**The studio hides itself while you record.** The browser is the only window on
+screen - nothing of ours sits over the page or catches a stray click.
+
+- **Press Esc in the page to stop.** Closing the browser window also stops it.
+- A small red "Recording - press Esc to stop" badge appears top-right on each
+  page and fades after a few seconds. It cannot be clicked through to or
+  interfere with the page - `pointer-events` is off.
 - Typing into one box is **one** step holding the final value, not one per key.
 - A lookup box (`role="combobox"`, `aria-autocomplete`, a select2/typeahead
   wrapper, a name like `itemSearch`) is captured as a **type** step, replayed one
@@ -62,8 +69,10 @@ the last one.
   follows is captured as the **pick**.
 - **Alt+click** records a check on whatever you clicked instead of a click -
   that is how you say "this is what proves the test passed".
-- Closing the browser window finishes the recording.
 - The session is also saved as a video, next to the test case.
+
+Nothing is saved until you have named it and been through the review and
+assertion popups - cancelling at any of those throws the recording away.
 
 Afterwards you get the step list to review: untick anything stray, reorder,
 delete, or rename a data column. Then the assertions popup.
@@ -195,7 +204,8 @@ bin\Debug\net8.0-windows\PlaywrightTestStudio.exe --selftest
 ```
 
 Walks the whole journey with no UI: builds a sample form, records a session on
-it, checks every action was captured, runs it, downloads the workbook, adds a
+it, checks every action was captured and that **Esc stops the recording**, runs
+it, downloads the workbook, adds a
 second data row the way a tester would, uploads it, runs both rows, confirms a
 row expecting the wrong thing fails **on its own**, and reads back the generated
 C#. Exit code 0 means all checks passed; the log, including the generated
@@ -203,6 +213,8 @@ fixture, is written to `%TEMP%\playwright-test-studio-selftest.log`.
 
 ## Known limits
 
+- Esc ends a recording, so an Esc keypress cannot itself be recorded as a step.
+  If the page needs one, add a `press` step with the value `Escape` afterwards.
 - Controls inside an `<iframe>` are not recorded or scanned.
 - Controls inside a shadow root are not recorded or scanned.
 - Navigating by typing in the address bar mid-recording is not captured; clicks

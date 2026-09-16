@@ -18,11 +18,20 @@ internal sealed class RecordingSession : IAsyncDisposable
     private readonly List<AssertionSpec> _assertions = new();
     private readonly object _gate = new();
 
+    // Completed asynchronously: it is set from a Playwright callback thread, and
+    // whatever is waiting belongs on the UI thread.
+    private readonly TaskCompletionSource _stopRequested =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public IPage Page { get; }
     public string Url { get; }
 
-    /// <summary>Raised on a background thread whenever a step or assertion lands.</summary>
-    public event Action? Changed;
+    /// <summary>
+    /// Completes when the operator presses Esc in the page, or closes the
+    /// browser window. Nothing of this application is on screen while a
+    /// recording runs, so those are the two ways to finish.
+    /// </summary>
+    public Task StopRequested => _stopRequested.Task;
 
     /// <summary>True once the browser window has been closed by the operator.</summary>
     public bool BrowserClosed { get; private set; }
@@ -97,7 +106,11 @@ internal sealed class RecordingSession : IAsyncDisposable
         // a click takes the operator to the next page.
         await context.AddInitScriptAsync(RecorderScript);
 
-        context.Close += (_, _) => session.BrowserClosed = true;
+        context.Close += (_, _) =>
+        {
+            session.BrowserClosed = true;
+            session._stopRequested.TrySetResult();
+        };
 
         await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
 
@@ -114,6 +127,12 @@ internal sealed class RecordingSession : IAsyncDisposable
         {
             var item = JsonDocument.Parse(json).RootElement;
             var kind = Str(item, "kind");
+
+            if (kind == "stop")
+            {
+                _stopRequested.TrySetResult();
+                return;
+            }
 
             lock (_gate)
             {
@@ -172,8 +191,6 @@ internal sealed class RecordingSession : IAsyncDisposable
                     }
                 }
             }
-
-            Changed?.Invoke();
         }
         catch (JsonException)
         {
@@ -489,8 +506,11 @@ internal sealed class RecordingSession : IAsyncDisposable
         });
       }, true);
 
-      // ---- Enter --------------------------------------------------------
+      // ---- keys ---------------------------------------------------------
       document.addEventListener('keydown', (e) => {
+        // Esc ends the recording, so it is never recorded as a keypress.
+        if (e.key === 'Escape') { send({ kind: 'stop' }); return; }
+
         if (e.key !== 'Enter') return;
         const el = e.target;
         if (!el || !el.tagName) return;
@@ -499,6 +519,33 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         send({ kind: 'press', selector: selectorFor(el), label: labelFor(el), value: 'Enter' });
       }, true);
+
+      // ---- a word about Esc ---------------------------------------------
+      // Shown on each page so it is clear the recording is still running, then
+      // gone. pointer-events:none, so it can never swallow a click meant for
+      // the page underneath it.
+      const hint = () => {
+        if (!document.body) return;
+
+        const box = document.createElement('div');
+        box.textContent = 'Recording - press Esc to stop';
+        box.setAttribute('data-pts-recorder', '1');
+        box.style.cssText =
+          'position:fixed;top:12px;right:12px;z-index:2147483647;' +
+          'background:#c42b1c;color:#fff;border-radius:4px;padding:8px 14px;' +
+          'font:600 13px "Segoe UI",system-ui,sans-serif;pointer-events:none;' +
+          'box-shadow:0 2px 8px rgba(0,0,0,.35);transition:opacity .6s ease;';
+
+        document.body.appendChild(box);
+        setTimeout(() => { box.style.opacity = '0'; }, 3500);
+        setTimeout(() => { box.remove(); }, 4300);
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', hint);
+      } else {
+        hint();
+      }
     })();
     """;
 }

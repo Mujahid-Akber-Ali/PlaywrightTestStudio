@@ -75,7 +75,13 @@ internal sealed class MainForm : Form
         var dataFolder = Ui.Secondary("Data folder", 336, 528, 130);
         var quit = Ui.Secondary("Quit", 630, 528, 100);
 
-        record.Click += (_, _) => { RecordDialogs.Record(this, _store); RefreshView(); };
+        record.Click += async (_, _) =>
+        {
+            // Async so the window can hide and the message loop keeps running
+            // while the recording is in progress.
+            await RecordDialogs.RecordAsync(this, _store);
+            RefreshView();
+        };
         showAll.Click += (_, _) => { TestCaseDialogs.ShowAll(this, _store); RefreshView(); };
         runAll.Click += (_, _) => { TestCaseDialogs.RunAll(this, _store); RefreshView(); };
         scan.Click += (_, _) => { ScanNewTestCase(); RefreshView(); };

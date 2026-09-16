@@ -43,7 +43,12 @@ internal static class SelfTest
             // ---------------------------------------------------------------
             // 1. Record a session, driving the page the way a person would.
             // ---------------------------------------------------------------
-            var test = RecordAsync(url, store, log).GetAwaiter().GetResult();
+            var recording = RecordAsync(url, store, log).GetAwaiter().GetResult();
+            var test = recording.Test;
+
+            Check("Esc in the page stops the recording", recording.StoppedByEscape);
+            Check("Esc was not itself recorded as a step",
+                !test.Steps.Any(s => s.Action == StepActions.Press && s.Value == "Escape"));
 
             log.AppendLine($"Recorded    : {test.Steps.Count} step(s)");
 
@@ -265,7 +270,8 @@ internal static class SelfTest
     /// Starts a recording and then drives the page with Playwright, which fires
     /// exactly the events a person's mouse and keyboard would.
     /// </summary>
-    private static async Task<TestCase> RecordAsync(string url, ProjectStore store, StringBuilder log)
+    private static async Task<(TestCase Test, bool StoppedByEscape)> RecordAsync(
+        string url, ProjectStore store, StringBuilder log)
     {
         var session = await RecordingSession.StartAsync(url, store.VideosDir, headless: true);
         var page = session.Page;
@@ -284,12 +290,27 @@ internal static class SelfTest
         await page.ClickAsync("#submit");
 
         // The page talks to the recorder through an exposed function, so give
-        // the last events a moment to arrive before the browser is closed.
+        // the last events a moment to arrive before finishing.
         await page.WaitForTimeoutAsync(600);
 
         log.AppendLine($"Recorder    : {session.Count} event(s) captured before stop");
 
-        return await session.StopAsync("Submit the sample form");
+        // This is how a person ends a recording: Esc, in the page, with no
+        // window of ours anywhere on screen.
+        await page.Keyboard.PressAsync("Escape");
+
+        var stopped = true;
+
+        try
+        {
+            await session.StopRequested.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (TimeoutException)
+        {
+            stopped = false;
+        }
+
+        return (await session.StopAsync("Submit the sample form"), stopped);
     }
 
     /// <summary>

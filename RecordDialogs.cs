@@ -12,8 +12,12 @@ internal static class RecordDialogs
     /// <summary>
     /// Records a new test case into the project. Returns the saved case, or null
     /// if the operator backed out.
+    ///
+    /// While the recording runs, this application shows nothing at all - the
+    /// browser is the only window on screen. Esc in the page, or closing the
+    /// browser, ends it.
     /// </summary>
-    public static TestCase? Record(IWin32Window owner, ProjectStore store)
+    public static async Task<TestCase?> RecordAsync(Form owner, ProjectStore store)
     {
         var url = ProjectDialogs.AskLink(owner, purpose: "record");
 
@@ -35,36 +39,28 @@ internal static class RecordDialogs
             return null;
         }
 
-        var kept = ShowRecordingWindow(owner, session);
-
-        if (!kept)
-        {
-            Ui.RunWithProgress<bool>(owner, "Discarding", "Closing the browser...",
-                async _ => { await session.DisposeAsync(); return true; });
-
-            return null;
-        }
-
-        var name = ProjectDialogs.AskText("Name", "Name this test case",
-            "It becomes the method name in the generated C# file and the sheet name in Excel.",
-            SuggestName(store, url));
-
-        if (name is null)
-        {
-            name = $"Recorded {DateTime.Now:yyyy-MM-dd HH:mm}";
-        }
-
         TestCase test;
+
+        // Out of the way entirely: no window of ours over the page being
+        // recorded, and no risk of a stray click landing on us.
+        owner.Hide();
 
         try
         {
-            test = Ui.RunWithProgress(owner, "Saving recording", "Closing the browser...",
-                async _ => await session.StopAsync(name));
+            await session.StopRequested;
+
+            test = await session.StopAsync($"Recorded {DateTime.Now:yyyy-MM-dd HH:mm}");
         }
         catch (Exception ex)
         {
+            owner.Show();
             Ui.Error(BrowserSession.Explain(ex));
             return null;
+        }
+        finally
+        {
+            owner.Show();
+            owner.Activate();
         }
 
         if (test.Steps.Count == 0)
@@ -74,6 +70,18 @@ internal static class RecordDialogs
                     "it is not recorded.");
             return null;
         }
+
+        var name = ProjectDialogs.AskText("Name", "Name this test case",
+            $"{test.Steps.Count} action(s) were captured. " +
+            "The name becomes the method in the generated C# file and the sheet name in Excel.",
+            SuggestName(store, url));
+
+        if (name is null)
+        {
+            return null;
+        }
+
+        test.Name = name;
 
         if (!EditSteps(owner, test, "Here is what was recorded"))
         {
@@ -111,110 +119,6 @@ internal static class RecordDialogs
         }
 
         return test;
-    }
-
-    /// <summary>
-    /// The small window that sits beside the browser while recording. It polls
-    /// rather than marshalling every event onto the UI thread - a recording is
-    /// a handful of actions a second at most.
-    /// </summary>
-    private static bool ShowRecordingWindow(IWin32Window owner, RecordingSession session)
-    {
-        using var form = Ui.NewForm($"{Ui.AppTitle} - Recording", 460, 280);
-        form.TopMost = true;
-        form.ControlBox = false;
-
-        var dot = new Label
-        {
-            Text = "REC",
-            Font = new Font("Segoe UI", 11F, FontStyle.Bold),
-            ForeColor = Color.White,
-            BackColor = Ui.Fail,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Location = new Point(20, 18),
-            Size = new Size(56, 26)
-        };
-
-        form.Controls.Add(dot);
-        form.Controls.Add(Ui.Title("Recording your session", 88, 18));
-
-        form.Controls.Add(Ui.Hint(
-            "Work through the page in the browser window. Everything you type, choose, tick and click " +
-            "is captured in order.", 22, 56, 410));
-
-        form.Controls.Add(Ui.Hint(
-            "Hold Alt and click anything to record a check on it instead of a click - that is how you say " +
-            "\"this is what proves the test passed\".", 22, 100, 410));
-
-        var count = new Label
-        {
-            Text = "0 actions captured",
-            Font = new Font("Segoe UI", 11F, FontStyle.Bold),
-            ForeColor = Ui.Accent,
-            AutoSize = true,
-            Location = new Point(22, 158)
-        };
-
-        var latest = new Label
-        {
-            Text = "",
-            Font = Ui.Body,
-            ForeColor = Ui.Muted,
-            AutoEllipsis = true,
-            Location = new Point(22, 182),
-            Size = new Size(410, 18)
-        };
-
-        var stop = Ui.Primary("Stop and save", 20, 214, 150);
-        var discard = Ui.Secondary("Discard", 178, 214, 110);
-
-        var kept = false;
-
-        stop.Click += (_, _) =>
-        {
-            kept = true;
-            form.DialogResult = DialogResult.OK;
-        };
-
-        discard.Click += (_, _) =>
-        {
-            if (session.Count == 0 || Ui.Confirm($"Throw away the {session.Count} action(s) recorded so far?"))
-            {
-                form.DialogResult = DialogResult.Cancel;
-            }
-        };
-
-        var timer = new System.Windows.Forms.Timer { Interval = 400 };
-
-        timer.Tick += (_, _) =>
-        {
-            var steps = session.Steps;
-            var assertions = session.Assertions.Count;
-
-            count.Text = $"{steps.Count} action(s) captured" +
-                         (assertions > 0 ? $", {assertions} check(s)" : "");
-
-            latest.Text = steps.Count > 0
-                ? "Last: " + Runner.Describe(steps[^1], steps[^1].Value)
-                : "";
-
-            // Closing the browser is a natural way to finish.
-            if (session.BrowserClosed)
-            {
-                timer.Stop();
-                kept = session.Count > 0;
-                form.DialogResult = kept ? DialogResult.OK : DialogResult.Cancel;
-            }
-        };
-
-        form.Shown += (_, _) => timer.Start();
-        form.FormClosed += (_, _) => { timer.Stop(); timer.Dispose(); };
-
-        form.Controls.AddRange(new Control[] { count, latest, stop, discard });
-
-        form.ShowDialog(owner);
-
-        return kept;
     }
 
     /// <summary>
