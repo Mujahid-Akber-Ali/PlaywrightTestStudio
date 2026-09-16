@@ -124,6 +124,10 @@ internal sealed class ProjectStore
 
     public string TestsDir => Path.Combine(Dir, "tests");
     public string ScreenshotsDir => Path.Combine(Dir, "screenshots");
+    public string VideosDir => Path.Combine(Dir, "videos");
+
+    /// <summary>Default name offered when the operator downloads the workbook.</summary>
+    public string WorkbookName => $"{Storage.Slug(Name)}-tests.xlsx";
     public string CodeDir => Path.Combine(Storage.CodeRoot, Storage.Slug(Name));
     private string RunLogFile => Path.Combine(Dir, "runs.json");
     private string MetaFile => Path.Combine(Dir, "project.json");
@@ -138,6 +142,7 @@ internal sealed class ProjectStore
     {
         Directory.CreateDirectory(TestsDir);
         Directory.CreateDirectory(ScreenshotsDir);
+        Directory.CreateDirectory(VideosDir);
         Directory.CreateDirectory(CodeDir);
 
         if (!File.Exists(MetaFile))
@@ -160,6 +165,7 @@ internal sealed class ProjectStore
 
                 if (tc is not null)
                 {
+                    Migrate(tc);
                     list.Add(tc);
                 }
             }
@@ -171,6 +177,70 @@ internal sealed class ProjectStore
         }
 
         return list.OrderByDescending(t => t.CreatedUtc).ToList();
+    }
+
+    /// <summary>
+    /// Folds a test case saved before ordered steps existed into the new shape:
+    /// every field became a step, then every button click, which is the order
+    /// those cases actually ran in.
+    /// </summary>
+    private static void Migrate(TestCase test)
+    {
+        if (test.Steps.Count > 0 || (test.Fields.Count == 0 && test.Clicks.Count == 0))
+        {
+            return;
+        }
+
+        foreach (var field in test.Fields)
+        {
+            var action = field.Kind switch
+            {
+                "select" => StepActions.Select,
+                "radio" => StepActions.Check,
+                "checkbox" => Runner.IsTruthy(field.Value) ? StepActions.Check : StepActions.Uncheck,
+                "search" => StepActions.Type,
+                _ => StepActions.Fill
+            };
+
+            test.Steps.Add(new TestStep
+            {
+                Use = field.Use,
+                Action = action,
+                Selector = field.Selector,
+                Label = field.Label,
+                Value = field.Kind is "checkbox" or "radio" ? "" : field.Value
+            });
+
+            // A search field was one row that meant "type, then pick"; that is
+            // two steps now.
+            if (field.Kind == "search" && field.Pick.Trim().Length > 0)
+            {
+                test.Steps.Add(new TestStep
+                {
+                    Action = StepActions.Click,
+                    Selector = field.ResultsSelector.Trim().Length > 0
+                        ? $"{field.ResultsSelector.Trim()} [role=option], {field.ResultsSelector.Trim()} li"
+                        : "[role=option]",
+                    Label = $"{field.Label} result",
+                    FallbackText = field.Pick.Trim()
+                });
+            }
+        }
+
+        foreach (var click in test.Clicks)
+        {
+            test.Steps.Add(new TestStep
+            {
+                Action = StepActions.Click,
+                Selector = click.Selector,
+                Label = click.Label,
+                WaitAfter = click.WaitAfter
+            });
+        }
+
+        test.Fields.Clear();
+        test.Clicks.Clear();
+        test.Source = "scanned";
     }
 
     public void Save(TestCase test)
@@ -217,6 +287,7 @@ internal sealed class ProjectStore
         {
             TestId = test.Id,
             TestName = test.Name,
+            DataSet = result.DataSet,
             Url = test.Url,
             Status = result.Status,
             Message = result.Message,

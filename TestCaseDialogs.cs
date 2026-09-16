@@ -4,8 +4,8 @@ using System.Windows.Forms;
 namespace PlaywrightTestStudio;
 
 /// <summary>
-/// The back half of the flow: naming the test case and its assertions, running
-/// it, and looking back over everything that has been recorded.
+/// The back half of the flow: what makes a test case pass, running it against
+/// every row of test data, and looking back over what has been recorded.
 /// </summary>
 internal static class TestCaseDialogs
 {
@@ -23,72 +23,72 @@ internal static class TestCaseDialogs
     /// </summary>
     public static AssertionChoice? AskAssertions(
         IWin32Window owner,
-        string url,
-        IReadOnlyList<ElementInfo> elements,
-        TestCase? existing = null,
+        TestCase test,
         string? suggestedName = null)
     {
-        using var form = Ui.NewForm($"{Ui.AppTitle} - Assertion", 940, 520, resizable: true);
+        using var form = Ui.NewForm($"{Ui.AppTitle} - Assertion", 980, 560, resizable: true);
 
         form.Controls.Add(Ui.Title("What should this test check?"));
         form.Controls.Add(Ui.Hint(
-            "Name the test case, then add the checks that decide pass or fail. " +
-            "They all run, and any failure fails the test.", 22, 46, 890));
+            "Name the test case, then add the checks that decide pass or fail. They all run, and any failure " +
+            "fails the test. Put a data column name in \"Data column\" to have the expected text come from the " +
+            "Excel sheet instead of being fixed.", 22, 46, 930));
 
-        var nameLabel = Ui.Hint("Test case name", 20, 82);
+        var nameLabel = Ui.Hint("Test case name", 20, 96);
         nameLabel.Font = Ui.Bold;
         nameLabel.ForeColor = SystemColors.ControlText;
 
         var nameInput = new TextBox
         {
             Font = Ui.Input,
-            Location = new Point(20, 102),
-            Size = new Size(896, 30),
-            Text = existing?.Name ?? suggestedName ?? "",
+            Location = new Point(20, 116),
+            Size = new Size(936, 30),
+            Text = test.Name.Length > 0 ? test.Name : suggestedName ?? "",
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
 
-        var grid = Ui.NewGrid(20, 148, 896, 258);
+        var grid = Ui.NewGrid(20, 162, 936, 264);
 
         var kindColumn = new DataGridViewComboBoxColumn
         {
             Name = "Kind",
             HeaderText = "Check",
-            Width = 200,
+            Width = 190,
             FlatStyle = FlatStyle.Flat
         };
 
         kindColumn.Items.AddRange(AssertionKinds.All);
 
         grid.Columns.Add(kindColumn);
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Selector", HeaderText = "Element selector (only for element checks)", Width = 300 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Selector", HeaderText = "Element (element checks only)", Width = 260 });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "Expected",
             HeaderText = "Expected text",
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Parameter", HeaderText = "Data column", Width = 130 });
 
         grid.DataError += (_, e) => e.ThrowException = false;
 
-        if (existing is not null && existing.Assertions.Count > 0)
+        if (test.Assertions.Count > 0)
         {
-            foreach (var spec in existing.Assertions)
+            foreach (var spec in test.Assertions)
             {
-                grid.Rows.Add(spec.Kind, spec.Selector, spec.Expected);
+                grid.Rows.Add(spec.Kind, spec.Selector, spec.Expected, spec.Parameter);
             }
         }
         else
         {
-            grid.Rows.Add(AssertionKinds.PageTextContains, "", "");
+            grid.Rows.Add(AssertionKinds.PageTextContains, "", "", "");
         }
 
-        var add = Ui.Secondary("Add check", 20, 422, 100);
-        var remove = Ui.Secondary("Remove", 128, 422, 90);
-        var pick = Ui.Secondary("Pick element...", 226, 422, 120);
-        var save = Ui.Primary("Save", 566, 422, 110);
-        var saveRun = Ui.Primary("Save and run", 684, 422, 124);
-        var cancel = Ui.Secondary("Cancel", 816, 422, 100);
+        var add = Ui.Secondary("Add check", 20, 442, 100);
+        var remove = Ui.Secondary("Remove", 128, 442, 90);
+        var pick = Ui.Secondary("Pick element...", 226, 442, 120);
+        var save = Ui.Primary("Save", 606, 442, 110);
+        var saveRun = Ui.Primary("Save and run", 724, 442, 124);
+        var cancel = Ui.Secondary("Cancel", 856, 442, 100);
 
         foreach (var control in new Control[] { add, remove, pick })
         {
@@ -100,7 +100,7 @@ internal static class TestCaseDialogs
             control.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
         }
 
-        add.Click += (_, _) => grid.Rows.Add(AssertionKinds.PageTextContains, "", "");
+        add.Click += (_, _) => grid.Rows.Add(AssertionKinds.PageTextContains, "", "", "");
 
         remove.Click += (_, _) =>
         {
@@ -117,7 +117,7 @@ internal static class TestCaseDialogs
                 return;
             }
 
-            var selector = PickElement(form, elements);
+            var selector = PickElement(form, test);
 
             if (selector is not null)
             {
@@ -154,18 +154,19 @@ internal static class TestCaseDialogs
                 {
                     Kind = kind,
                     Selector = row.Cells["Selector"].Value?.ToString()?.Trim() ?? "",
-                    Expected = row.Cells["Expected"].Value?.ToString()?.Trim() ?? ""
+                    Expected = row.Cells["Expected"].Value?.ToString()?.Trim() ?? "",
+                    Parameter = row.Cells["Parameter"].Value?.ToString()?.Trim() ?? ""
                 };
 
                 if (AssertionKinds.NeedsSelector(kind) && spec.Selector.Length == 0)
                 {
-                    Ui.Warn($"\"{kind}\" needs an element selector.\r\nUse \"Pick element...\" to choose one.");
+                    Ui.Warn($"\"{kind}\" needs an element.\r\nUse \"Pick element...\" to choose one from the recording.");
                     return null;
                 }
 
-                if (AssertionKinds.NeedsExpected(kind) && spec.Expected.Length == 0)
+                if (AssertionKinds.NeedsExpected(kind) && spec.Expected.Length == 0 && spec.Parameter.Length == 0)
                 {
-                    Ui.Warn($"\"{kind}\" needs the text to look for.");
+                    Ui.Warn($"\"{kind}\" needs the text to look for, or a data column to take it from.");
                     return null;
                 }
 
@@ -213,17 +214,22 @@ internal static class TestCaseDialogs
         return form.ShowDialog(owner) == DialogResult.OK ? choice : null;
     }
 
-    /// <summary>A short list of the scanned controls, for filling in a selector.</summary>
-    private static string? PickElement(IWin32Window owner, IReadOnlyList<ElementInfo> elements)
+    /// <summary>
+    /// The elements this test case already touches, so an assertion can point at
+    /// one without anybody typing a selector.
+    /// </summary>
+    private static string? PickElement(IWin32Window owner, TestCase test)
     {
-        using var form = Ui.NewForm($"{Ui.AppTitle} - Pick element", 720, 440, resizable: true);
+        using var form = Ui.NewForm($"{Ui.AppTitle} - Pick element", 760, 460, resizable: true);
 
         form.Controls.Add(Ui.Title("Which element?"));
+        form.Controls.Add(Ui.Hint("Everything this test case touches, plus anything found by a page scan.",
+            22, 46, 700));
 
-        var grid = Ui.NewGrid(20, 56, 676, 300);
+        var grid = Ui.NewGrid(20, 76, 716, 300);
         grid.ReadOnly = true;
         grid.EditMode = DataGridViewEditMode.EditProgrammatically;
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Type", HeaderText = "Type", Width = 80 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "From", HeaderText = "From", Width = 80 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Field", HeaderText = "Field / label", Width = 240 });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
@@ -232,14 +238,31 @@ internal static class TestCaseDialogs
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         });
 
-        foreach (var element in elements)
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddRow(string from, string label, string selector)
         {
-            var index = grid.Rows.Add(ScanDialogs.KindLabel(element.Kind), element.Display, element.Selector);
+            if (selector.Length == 0 || !seen.Add(selector))
+            {
+                return;
+            }
+
+            var index = grid.Rows.Add(from, label, selector);
             grid.Rows[index].Cells["Selector"].Style.Font = Ui.Mono;
         }
 
-        var use = Ui.Primary("Use this", 468, 372, 110);
-        var cancel = Ui.Secondary("Cancel", 586, 372, 110);
+        foreach (var step in test.Steps)
+        {
+            AddRow(step.Action, step.Display, step.Selector);
+        }
+
+        foreach (var element in test.Elements)
+        {
+            AddRow(ScanDialogs.KindLabel(element.Kind), element.Display, element.Selector);
+        }
+
+        var use = Ui.Primary("Use this", 508, 392, 110);
+        var cancel = Ui.Secondary("Cancel", 626, 392, 110);
         use.Anchor = cancel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
 
         use.Click += (_, _) => form.DialogResult = DialogResult.OK;
@@ -256,74 +279,24 @@ internal static class TestCaseDialogs
     }
 
     /// <summary>
-    /// Runs one test case, stores the result on the case and in the project run
-    /// log, and refreshes the generated C# file so its comment header matches.
+    /// Runs one test case against every enabled data row, stores each result,
+    /// and refreshes the generated C# file.
     /// </summary>
-    public static TestResult RunAndSave(IWin32Window owner, ProjectStore store, TestCase test)
+    public static List<TestResult> RunAndSave(IWin32Window owner, ProjectStore store, TestCase test)
     {
-        var result = Ui.RunWithProgress(owner, $"Running: {test.Name}", "Starting...",
-            report => Runner.RunAsync(test, store, AppSettings.Headless, report));
+        var results = Ui.RunWithProgress(owner, $"Running: {test.Name}", "Starting...",
+            report => Runner.RunAllDataSetsAsync(test, store, AppSettings.Headless, report));
 
-        test.LastResult = result;
         store.Save(test);
-        store.AppendRun(test, result);
+
+        foreach (var result in results)
+        {
+            store.AppendRun(test, result);
+        }
 
         RegenerateCode(store, test);
 
-        return result;
-    }
-
-    /// <summary>
-    /// Runs every test case in the project, one after another, and reports the
-    /// tally. Sequential on purpose: they share one browser profile.
-    /// </summary>
-    public static void RunAll(IWin32Window owner, ProjectStore store)
-    {
-        var tests = store.LoadAll();
-
-        if (tests.Count == 0)
-        {
-            Ui.Info("There are no test cases in this project yet.");
-            return;
-        }
-
-        if (!Ui.Confirm($"Run all {tests.Count} test case(s) now?"))
-        {
-            return;
-        }
-
-        var results = Ui.RunWithProgress(owner, "Running all test cases", "Starting...",
-            async report =>
-            {
-                var log = new List<(TestCase Test, TestResult Result)>();
-
-                for (var i = 0; i < tests.Count; i++)
-                {
-                    var test = tests[i];
-                    var position = i + 1;
-
-                    var result = await Runner.RunAsync(test, store, AppSettings.Headless,
-                        line => report($"[{position}/{tests.Count}] {test.Name} - {line}"));
-
-                    test.LastResult = result;
-                    store.Save(test);
-                    store.AppendRun(test, result);
-                    log.Add((test, result));
-                }
-
-                return log;
-            });
-
-        foreach (var (test, _) in results)
-        {
-            RegenerateCode(store, test);
-        }
-
-        var passed = results.Count(r => r.Result.IsPass);
-
-        Ui.Info($"{passed} of {results.Count} test case(s) passed.\r\n\r\n" +
-                string.Join("\r\n", results.Select(r => $"{(r.Result.IsPass ? "PASS" : "FAIL")}  {r.Test.Name}")),
-            $"{Ui.AppTitle} - run finished");
+        return results;
     }
 
     /// <summary>Rewrites the file that covers this test case's link.</summary>
@@ -340,33 +313,98 @@ internal static class TestCaseDialogs
         store.Save(test);
     }
 
-    /// <summary>The pass/fail popup shown straight after a run.</summary>
-    public static void ShowResult(IWin32Window owner, TestCase test, TestResult result)
+    /// <summary>
+    /// Runs every test case in the project, each against all its data rows.
+    /// Sequential on purpose: they share one browser profile.
+    /// </summary>
+    public static void RunAll(IWin32Window owner, ProjectStore store)
     {
-        using var form = Ui.NewForm($"{Ui.AppTitle} - {result.Status}", 760, 480, resizable: true);
+        var tests = store.LoadAll().Where(t => t.Enabled).ToList();
+
+        if (tests.Count == 0)
+        {
+            Ui.Info("There are no enabled test cases in this project yet.");
+            return;
+        }
+
+        var rows = tests.Sum(t => t.RunnableDataSets().Count);
+
+        if (!Ui.Confirm($"Run {tests.Count} test case(s) over {rows} data row(s) now?"))
+        {
+            return;
+        }
+
+        var all = Ui.RunWithProgress(owner, "Running all test cases", "Starting...",
+            async report =>
+            {
+                var log = new List<(TestCase Test, TestResult Result)>();
+
+                for (var i = 0; i < tests.Count; i++)
+                {
+                    var test = tests[i];
+                    var position = i + 1;
+
+                    var results = await Runner.RunAllDataSetsAsync(test, store, AppSettings.Headless,
+                        line => report($"[{position}/{tests.Count}] {test.Name} - {line}"));
+
+                    store.Save(test);
+
+                    foreach (var result in results)
+                    {
+                        store.AppendRun(test, result);
+                        log.Add((test, result));
+                    }
+                }
+
+                return log;
+            });
+
+        foreach (var test in all.Select(r => r.Test).Distinct())
+        {
+            RegenerateCode(store, test);
+        }
+
+        var passed = all.Count(r => r.Result.IsPass);
+
+        Ui.Info($"{passed} of {all.Count} run(s) passed.\r\n\r\n" +
+                string.Join("\r\n", all.Select(r =>
+                    $"{(r.Result.IsPass ? "PASS" : "FAIL")}  {r.Test.Name}" +
+                    (r.Result.DataSet.Length > 0 ? $"  [{r.Result.DataSet}]" : ""))),
+            $"{Ui.AppTitle} - run finished");
+    }
+
+    /// <summary>The pass/fail popup shown straight after a run.</summary>
+    public static void ShowResult(IWin32Window owner, TestCase test, List<TestResult> results)
+    {
+        var overall = results.Count > 0 && results.All(r => r.IsPass);
+
+        using var form = Ui.NewForm($"{Ui.AppTitle} - {(overall ? "Passed" : "Failed")}", 820, 520, resizable: true);
 
         var banner = new Label
         {
-            Text = result.IsPass ? "PASSED" : result.Status.ToUpperInvariant(),
+            Text = overall ? "PASSED" : "FAILED",
             Font = new Font("Segoe UI", 16F, FontStyle.Bold),
             ForeColor = Color.White,
-            BackColor = result.IsPass ? Ui.Pass : Ui.Fail,
+            BackColor = overall ? Ui.Pass : Ui.Fail,
             TextAlign = ContentAlignment.MiddleLeft,
             Padding = new Padding(16, 0, 0, 0),
             Location = new Point(0, 0),
-            Size = new Size(760, 52),
+            Size = new Size(820, 52),
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
 
         form.Controls.Add(banner);
-        form.Controls.Add(Ui.Hint($"{test.Name}    -    {test.Url}", 20, 64, 710));
-        form.Controls.Add(Ui.Hint($"{result.Message}    ({result.Seconds}s)", 20, 88, 710));
+        form.Controls.Add(Ui.Hint($"{test.Name}    -    {test.Url}", 20, 64, 770));
 
-        var grid = Ui.NewGrid(20, 128, 716, 260);
+        var passed = results.Count(r => r.IsPass);
+        form.Controls.Add(Ui.Hint($"{passed} of {results.Count} data row(s) passed.", 20, 88, 770));
+
+        var grid = Ui.NewGrid(20, 128, 776, 300);
         grid.ReadOnly = true;
         grid.EditMode = DataGridViewEditMode.EditProgrammatically;
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Result", HeaderText = "Result", Width = 70 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Check", HeaderText = "Check", Width = 320 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Result", HeaderText = "Result", Width = 60 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "DataSet", HeaderText = "Data row", Width = 120 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Check", HeaderText = "Check", Width = 300 });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "Actual",
@@ -374,27 +412,52 @@ internal static class TestCaseDialogs
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         });
 
-        foreach (var assertion in result.Assertions)
+        foreach (var result in results)
         {
-            var index = grid.Rows.Add(assertion.Passed ? "pass" : "FAIL", assertion.Description, assertion.Actual);
-            grid.Rows[index].Cells["Result"].Style.ForeColor = assertion.Passed ? Ui.Pass : Ui.Fail;
-            grid.Rows[index].Cells["Result"].Style.Font = Ui.Bold;
+            if (result.Assertions.Count == 0)
+            {
+                var only = grid.Rows.Add(result.Status, result.DataSet, result.Message, "");
+                grid.Rows[only].Cells["Result"].Style.ForeColor = Ui.Fail;
+                grid.Rows[only].Tag = result;
+                continue;
+            }
+
+            foreach (var assertion in result.Assertions)
+            {
+                var index = grid.Rows.Add(assertion.Passed ? "pass" : "FAIL", result.DataSet,
+                    assertion.Description, assertion.Actual);
+
+                grid.Rows[index].Cells["Result"].Style.ForeColor = assertion.Passed ? Ui.Pass : Ui.Fail;
+                grid.Rows[index].Cells["Result"].Style.Font = Ui.Bold;
+                grid.Rows[index].Tag = result;
+            }
         }
 
-        var shot = Ui.Secondary("Open screenshot", 20, 404, 130);
-        var code = Ui.Secondary("Open C# file", 148, 404, 120);
-        var close = Ui.Primary("Close", 626, 404, 110);
+        var shot = Ui.Secondary("Open screenshot", 20, 444, 130);
+        var code = Ui.Secondary("Open C# file", 148, 444, 120);
+        var video = Ui.Secondary("Open recording", 276, 444, 130);
+        var close = Ui.Primary("Close", 686, 444, 110);
 
-        shot.Anchor = code.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+        foreach (var control in new Control[] { shot, code, video })
+        {
+            control.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
+        }
+
         close.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-        shot.Enabled = result.ScreenshotPath.Length > 0;
         code.Enabled = test.CodeFile.Length > 0;
+        video.Enabled = test.VideoFile.Length > 0 && File.Exists(test.VideoFile);
 
-        shot.Click += (_, _) => Ui.Reveal(result.ScreenshotPath);
+        shot.Click += (_, _) =>
+        {
+            var chosen = (grid.CurrentRow?.Tag as TestResult) ?? results.FirstOrDefault();
+            Ui.Reveal(chosen?.ScreenshotPath ?? "");
+        };
+
         code.Click += (_, _) => Ui.Reveal(test.CodeFile);
+        video.Click += (_, _) => Ui.Reveal(test.VideoFile);
         close.Click += (_, _) => form.DialogResult = DialogResult.OK;
 
-        form.Controls.AddRange(new Control[] { grid, shot, code, close });
+        form.Controls.AddRange(new Control[] { grid, shot, code, video, close });
         form.AcceptButton = close;
         form.CancelButton = close;
 
@@ -402,29 +465,31 @@ internal static class TestCaseDialogs
     }
 
     /// <summary>
-    /// The "all test cases" popup: every scenario in the project with how it
-    /// last did, and the buttons to run them again.
+    /// The "all test cases" popup: every scenario in the project, how many data
+    /// rows it carries, and how it last did.
     /// </summary>
     public static void ShowAll(IWin32Window owner, ProjectStore store)
     {
-        using var form = Ui.NewForm($"{Ui.AppTitle} - {store.Name} - all test cases", 1000, 600, resizable: true);
+        using var form = Ui.NewForm($"{Ui.AppTitle} - {store.Name} - all test cases", 1040, 620, resizable: true);
 
         form.Controls.Add(Ui.Title("All test cases"));
 
-        var summary = Ui.Hint("", 22, 46, 950);
+        var summary = Ui.Hint("", 22, 46, 990);
 
-        var grid = Ui.NewGrid(20, 76, 956, 442);
+        var grid = Ui.NewGrid(20, 76, 996, 452);
         grid.ReadOnly = true;
         grid.EditMode = DataGridViewEditMode.EditProgrammatically;
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Status", HeaderText = "Status", Width = 70 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Test case", Width = 230 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Test case", Width = 220 });
         grid.Columns.Add(new DataGridViewTextBoxColumn
         {
             Name = "Url",
             HeaderText = "Link",
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Steps", HeaderText = "Fields / clicks / checks", Width = 150 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Data", HeaderText = "Data rows", Width = 80 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Steps", HeaderText = "Steps", Width = 60 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "Checks", HeaderText = "Checks", Width = 60 });
         grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "LastRun", HeaderText = "Last run", Width = 130 });
 
         var tests = new List<TestCase>();
@@ -441,11 +506,15 @@ internal static class TestCaseDialogs
                     ? "-"
                     : test.LastResult.RanUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
 
+                var rows = test.DataSets.Count(d => d.Enabled);
+
                 var index = grid.Rows.Add(
                     status,
                     test.Name,
                     test.Url,
-                    $"{test.Fields.Count} / {test.Clicks.Count} / {test.Assertions.Count}",
+                    rows == 0 ? "1" : rows.ToString(),
+                    test.Steps.Count(s => s.Use).ToString(),
+                    test.Assertions.Count.ToString(),
                     lastRun);
 
                 grid.Rows[index].Tag = test;
@@ -456,29 +525,36 @@ internal static class TestCaseDialogs
                     "Failed" or "Error" => Ui.Fail,
                     _ => Ui.Muted
                 };
+
+                if (!test.Enabled)
+                {
+                    grid.Rows[index].DefaultCellStyle.ForeColor = Ui.Muted;
+                }
             }
 
             var passed = tests.Count(t => t.LastResult?.IsPass == true);
             var failed = tests.Count(t => t.LastResult is not null && !t.LastResult.IsPass);
             var never = tests.Count - passed - failed;
+            var dataRows = tests.Sum(t => t.RunnableDataSets().Count);
 
-            summary.Text = $"{tests.Count} test case(s) across {tests.Select(t => t.Url).Distinct().Count()} link(s)" +
-                           $"    -    {passed} passed, {failed} failed, {never} never run";
+            summary.Text = $"{tests.Count} test case(s) across {tests.Select(t => t.Url).Distinct().Count()} link(s), " +
+                           $"{dataRows} data row(s)    -    {passed} passed, {failed} failed, {never} never run";
         }
 
         Reload();
 
         TestCase? Selected() => grid.CurrentRow?.Tag as TestCase;
 
-        var run = Ui.Primary("Run selected", 20, 534, 120);
-        var runAll = Ui.Primary("Run all", 148, 534, 100);
-        var details = Ui.Secondary("Last result", 256, 534, 110);
-        var edit = Ui.Secondary("Edit data", 374, 534, 100);
-        var openCode = Ui.Secondary("Open C# file", 482, 534, 110);
-        var delete = Ui.Secondary("Delete", 600, 534, 90);
-        var close = Ui.Secondary("Close", 876, 534, 100);
+        var run = Ui.Primary("Run selected", 20, 544, 120);
+        var runAll = Ui.Primary("Run all", 148, 544, 90);
+        var details = Ui.Secondary("Last result", 246, 544, 100);
+        var steps = Ui.Secondary("Edit steps", 354, 544, 100);
+        var checks = Ui.Secondary("Edit checks", 462, 544, 100);
+        var openCode = Ui.Secondary("Open C# file", 570, 544, 110);
+        var delete = Ui.Secondary("Delete", 688, 544, 80);
+        var close = Ui.Secondary("Close", 916, 544, 100);
 
-        foreach (var control in new Control[] { run, runAll, details, edit, openCode, delete })
+        foreach (var control in new Control[] { run, runAll, details, steps, checks, openCode, delete })
         {
             control.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
         }
@@ -492,9 +568,9 @@ internal static class TestCaseDialogs
                 return;
             }
 
-            var result = RunAndSave(form, store, test);
+            var results = RunAndSave(form, store, test);
             Reload();
-            ShowResult(form, test, result);
+            ShowResult(form, test, results);
         };
 
         runAll.Click += (_, _) =>
@@ -510,37 +586,45 @@ internal static class TestCaseDialogs
                 return;
             }
 
-            if (test.LastResult is null)
+            if (test.LastResults.Count == 0 && test.LastResult is null)
             {
                 Ui.Info("This test case has not been run yet.");
                 return;
             }
 
-            ShowResult(form, test, test.LastResult);
+            var results = test.LastResults.Count > 0
+                ? test.LastResults
+                : new List<TestResult> { test.LastResult! };
+
+            ShowResult(form, test, results);
         };
 
-        edit.Click += (_, _) =>
+        steps.Click += (_, _) =>
         {
             if (Selected() is not { } test)
             {
                 return;
             }
 
-            if (test.Elements.Count == 0)
-            {
-                Ui.Warn("This test case has no saved scan, so there is nothing to edit.\r\n" +
-                        "Scan the link again to rebuild it.");
-                return;
-            }
-
-            var data = ScanDialogs.AskData(form, test.Url, test.Elements, test);
-
-            if (data is null)
+            if (!RecordDialogs.EditSteps(form, test, $"Steps: {test.Name}"))
             {
                 return;
             }
 
-            var choice = AskAssertions(form, test.Url, test.Elements, test);
+            RecordDialogs.SyncRecordedRow(test);
+            store.Save(test);
+            RegenerateCode(store, test);
+            Reload();
+        };
+
+        checks.Click += (_, _) =>
+        {
+            if (Selected() is not { } test)
+            {
+                return;
+            }
+
+            var choice = AskAssertions(form, test);
 
             if (choice is null)
             {
@@ -548,19 +632,18 @@ internal static class TestCaseDialogs
             }
 
             test.Name = choice.Name;
-            test.Fields = data.Value.Fields;
-            test.Clicks = data.Value.Clicks;
             test.Assertions = choice.Assertions;
 
+            RecordDialogs.SyncRecordedRow(test);
             store.Save(test);
             RegenerateCode(store, test);
             Reload();
 
             if (choice.RunNow)
             {
-                var result = RunAndSave(form, store, test);
+                var results = RunAndSave(form, store, test);
                 Reload();
-                ShowResult(form, test, result);
+                ShowResult(form, test, results);
             }
         };
 
@@ -604,7 +687,11 @@ internal static class TestCaseDialogs
         };
 
         form.Controls.Add(summary);
-        form.Controls.AddRange(new Control[] { grid, run, runAll, details, edit, openCode, delete, close });
+        form.Controls.AddRange(new Control[]
+        {
+            grid, run, runAll, details, steps, checks, openCode, delete, close
+        });
+
         form.CancelButton = close;
 
         form.ShowDialog(owner);

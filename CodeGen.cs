@@ -6,6 +6,9 @@ namespace PlaywrightTestStudio;
 /// Writes the C# file for a link. One link, one file, one [Test] method per
 /// test case recorded against it - so the file is a readable NUnit + Playwright
 /// fixture you can run from Visual Studio or CI, not a dump of JSON.
+///
+/// A test case with more than one data set becomes a parameterised method with
+/// one [TestCase] attribute per row, which is the NUnit shape for exactly this.
 /// </summary>
 internal static class CodeGen
 {
@@ -29,6 +32,7 @@ internal static class CodeGen
         sb.AppendLine($"// Written : {DateTime.Now:yyyy-MM-dd HH:mm}");
         sb.AppendLine("// ---------------------------------------------------------------------------");
         sb.AppendLine();
+        sb.AppendLine("using System;");
         sb.AppendLine("using System.Threading.Tasks;");
         sb.AppendLine("using Microsoft.Playwright;");
         sb.AppendLine("using Microsoft.Playwright.NUnit;");
@@ -50,6 +54,13 @@ internal static class CodeGen
             AppendTestMethod(sb, test, usedNames);
         }
 
+        if (testsForLink.Any(t => t.Steps.Any(s => s.Use && s.Action == StepActions.Click &&
+                                                   s.FallbackText.Trim().Length > 0)))
+        {
+            sb.AppendLine();
+            AppendClickHelper(sb);
+        }
+
         sb.AppendLine("}");
 
         File.WriteAllText(file, sb.ToString());
@@ -61,6 +72,12 @@ internal static class CodeGen
     private static void AppendTestMethod(StringBuilder sb, TestCase test, HashSet<string> usedNames)
     {
         var method = UniqueMethodName(test, usedNames);
+        var parameters = test.Parameters();
+        var sets = test.DataSets.Where(d => d.Enabled).ToList();
+
+        // One row of data is just the recorded run, so the literals read better
+        // inline than as a parameterised case.
+        var dataDriven = parameters.Count > 0 && sets.Count > 1;
 
         sb.AppendLine("    /// <summary>");
         sb.AppendLine($"    /// {Comment(test.Name)}");
@@ -72,43 +89,53 @@ internal static class CodeGen
         }
 
         sb.AppendLine("    /// </summary>");
-        sb.AppendLine("    [Test]");
-        sb.AppendLine($"    public async Task {method}()");
+
+        if (dataDriven)
+        {
+            foreach (var set in sets)
+            {
+                var values = parameters.Select(p => Literal(set.Values.TryGetValue(p, out var v) ? v : ""));
+
+                sb.AppendLine($"    [TestCase({string.Join(", ", values)}, " +
+                              $"TestName = {Literal($"{test.Name} - {set.Name}")})]");
+            }
+
+            var signature = string.Join(", ", parameters.Select(p => $"string {p}"));
+            sb.AppendLine($"    public async Task {method}({signature})");
+        }
+        else
+        {
+            sb.AppendLine("    [Test]");
+            sb.AppendLine($"    public async Task {method}()");
+        }
+
         sb.AppendLine("    {");
         sb.AppendLine("        await Page.GotoAsync(Url);");
 
-        var fields = test.Fields.Where(f => f.Use).ToList();
+        // With one data set, a step's value is whatever that row supplies; with
+        // several, it is the method parameter NUnit passes in.
+        var single = sets.FirstOrDefault() ?? new DataSet();
 
-        if (fields.Count > 0)
+        string ValueOf(string parameter, string recorded) =>
+            dataDriven && parameter.Length > 0
+                ? parameter
+                : Literal(Runner.Resolve(parameter, recorded, single));
+
+        var steps = test.Steps.Where(s => s.Use).ToList();
+
+        if (steps.Count > 0)
         {
             sb.AppendLine();
-            sb.AppendLine("        // Data entered on the form");
+            sb.AppendLine("        // Recorded actions, in order");
 
-            // Search fields declare a local, so the names have to be unique
-            // within the method even when two boxes carry the same label.
             var locals = new HashSet<string>(StringComparer.Ordinal);
 
-            foreach (var field in fields)
+            foreach (var step in steps)
             {
-                foreach (var line in FieldStatements(field, UniqueLocal(locals, SearchVariable(field))))
+                foreach (var line in StepStatements(step, ValueOf(step.Parameter, step.RecordedValue),
+                             UniqueLocal(locals, SearchVariable(step))))
                 {
                     sb.AppendLine($"        {line}");
-                }
-            }
-        }
-
-        if (test.Clicks.Count > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine("        // Buttons pressed, in order");
-
-            foreach (var click in test.Clicks)
-            {
-                sb.AppendLine($"        await Page.ClickAsync({Literal(click.Selector)});   // {Comment(click.Label)}");
-
-                if (click.WaitAfter)
-                {
-                    sb.AppendLine("        await Page.WaitForLoadStateAsync(LoadState.NetworkIdle);");
                 }
             }
         }
@@ -124,7 +151,7 @@ internal static class CodeGen
         {
             foreach (var assertion in test.Assertions)
             {
-                foreach (var line in AssertionStatements(assertion))
+                foreach (var line in AssertionStatements(assertion, ValueOf(assertion.Parameter, assertion.Expected)))
                 {
                     sb.AppendLine($"        {line}");
                 }
@@ -134,110 +161,89 @@ internal static class CodeGen
         sb.AppendLine("    }");
     }
 
-    private static IEnumerable<string> FieldStatements(FieldValue field, string searchVar)
+    /// <summary>
+    /// Statements for one step. <paramref name="value"/> arrives already in C#
+    /// form: a quoted literal, or the name of a method parameter.
+    /// </summary>
+    private static IEnumerable<string> StepStatements(TestStep step, string value, string searchVar)
     {
-        var note = $"   // {Comment(field.Label)}";
+        var note = step.Label.Trim().Length > 0 ? $"   // {Comment(step.Label)}" : "";
 
-        switch (field.Kind)
+        switch (step.Action)
         {
-            case "select":
-                yield return $"await Page.SelectOptionAsync({Literal(field.Selector)}, " +
-                             $"new SelectOptionValue {{ Label = {Literal(field.Value)} }});{note}";
+            case StepActions.Goto:
+                yield return $"await Page.GotoAsync({value});{note}";
                 break;
 
-            case "search":
-            {
+            case StepActions.Type:
                 // Typed key by key, because lookup widgets search on key events
                 // and ignore a value that is simply assigned.
-                yield return $"var {searchVar} = Page.Locator({Literal(field.Selector)}).First;{note}";
+                yield return $"var {searchVar} = Page.Locator({Literal(step.Selector)}).First;{note}";
                 yield return $"await {searchVar}.ClickAsync();";
-                yield return $"await {searchVar}.PressSequentiallyAsync({Literal(field.Value)}, " +
+                yield return $"await {searchVar}.FillAsync(\"\");";
+                yield return $"await {searchVar}.PressSequentiallyAsync({value}, " +
                              "new LocatorPressSequentiallyOptions { Delay = 60 });";
+                yield return "await Page.WaitForTimeoutAsync(600);";
+                break;
 
-                var pick = field.Pick.Trim();
+            case StepActions.Select:
+                yield return $"await Page.Locator({Literal(step.Selector)}).First" +
+                             $".SelectOptionAsync(new SelectOptionValue {{ Label = {value} }});{note}";
+                break;
 
-                if (pick.Length == 0)
+            case StepActions.Check:
+                yield return $"await Page.Locator({Literal(step.Selector)}).First.CheckAsync();{note}";
+                break;
+
+            case StepActions.Uncheck:
+                yield return $"await Page.Locator({Literal(step.Selector)}).First.UncheckAsync();{note}";
+                break;
+
+            case StepActions.Click:
+                if (step.FallbackText.Trim().Length > 0)
                 {
-                    yield return "await Page.GetByRole(AriaRole.Option).First";
-                    yield return "    .ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
-                }
-                else if (field.ResultsSelector.Trim().Length > 0)
-                {
-                    var scope = field.ResultsSelector.Trim();
-
-                    yield return $"await Page.Locator({Literal($"{scope} [role=option], {scope} li, {scope} option")})";
-                    yield return $"    .Filter(new LocatorFilterOptions {{ HasTextString = {Literal(pick)} }})";
-                    yield return "    .First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
+                    yield return $"await ClickStepAsync({Literal(step.Selector)}, {value});{note}";
                 }
                 else
                 {
-                    yield return $"await Page.GetByRole(AriaRole.Option, new PageGetByRoleOptions {{ Name = {Literal(pick)} }})";
-                    yield return "    .First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });";
+                    yield return $"await Page.Locator({Literal(step.Selector)}).First.ClickAsync();{note}";
+                }
+
+                if (step.WaitAfter)
+                {
+                    yield return "await Page.WaitForLoadStateAsync(LoadState.NetworkIdle);";
                 }
 
                 break;
-            }
 
-            case "radio":
-                yield return $"await Page.CheckAsync({Literal(field.Selector)});{note}";
-                break;
-
-            case "checkbox":
-                yield return $"await Page.SetCheckedAsync({Literal(field.Selector)}, " +
-                             $"{(Runner.IsTruthy(field.Value) ? "true" : "false")});{note}";
+            case StepActions.Press:
+                yield return $"await Page.Locator({Literal(step.Selector)}).First.PressAsync({value});{note}";
                 break;
 
             default:
-                yield return $"await Page.FillAsync({Literal(field.Selector)}, {Literal(field.Value)});{note}";
+                yield return $"await Page.Locator({Literal(step.Selector)}).First.FillAsync({value});{note}";
                 break;
         }
     }
 
-    /// <summary>Makes a local name unique within the method being written.</summary>
-    private static string UniqueLocal(HashSet<string> used, string name)
-    {
-        var candidate = name;
-        var n = 2;
-
-        while (!used.Add(candidate))
-        {
-            candidate = $"{name}{n++}";
-        }
-
-        return candidate;
-    }
-
-    /// <summary>A readable local name for the search box a step is driving.</summary>
-    private static string SearchVariable(FieldValue field)
-    {
-        var name = Storage.Identifier(field.Label.Length > 0 ? field.Label : "search");
-
-        if (name.Length > 24)
-        {
-            name = name[..24];
-        }
-
-        return char.ToLowerInvariant(name[0]) + name[1..] + "Search";
-    }
-
-    private static IEnumerable<string> AssertionStatements(AssertionSpec spec)
+    private static IEnumerable<string> AssertionStatements(AssertionSpec spec, string expected)
     {
         switch (spec.Kind)
         {
             case AssertionKinds.UrlContains:
-                yield return $"Assert.That(Page.Url, Does.Contain({Literal(spec.Expected)}).IgnoreCase);";
+                yield return $"Assert.That(Page.Url, Does.Contain({expected}).IgnoreCase);";
                 break;
 
             case AssertionKinds.TitleContains:
-                yield return $"Assert.That(await Page.TitleAsync(), Does.Contain({Literal(spec.Expected)}).IgnoreCase);";
+                yield return $"Assert.That(await Page.TitleAsync(), Does.Contain({expected}).IgnoreCase);";
                 break;
 
             case AssertionKinds.PageTextContains:
-                yield return $"Assert.That(await Page.InnerTextAsync(\"body\"), Does.Contain({Literal(spec.Expected)}).IgnoreCase);";
+                yield return $"Assert.That(await Page.InnerTextAsync(\"body\"), Does.Contain({expected}).IgnoreCase);";
                 break;
 
             case AssertionKinds.PageTextNotContains:
-                yield return $"Assert.That(await Page.InnerTextAsync(\"body\"), Does.Not.Contain({Literal(spec.Expected)}).IgnoreCase);";
+                yield return $"Assert.That(await Page.InnerTextAsync(\"body\"), Does.Not.Contain({expected}).IgnoreCase);";
                 break;
 
             case AssertionKinds.ElementVisible:
@@ -249,13 +255,13 @@ internal static class CodeGen
                 break;
 
             case AssertionKinds.ElementTextContains:
-                yield return $"await Expect(Page.Locator({Literal(spec.Selector)}).First)" +
-                             $".ToContainTextAsync({Literal(spec.Expected)});";
+                yield return $"await Expect(Page.Locator({Literal(spec.Selector)}).First)";
+                yield return $"    .ToContainTextAsync({expected});";
                 break;
 
             case AssertionKinds.ElementValueEquals:
-                yield return $"await Expect(Page.Locator({Literal(spec.Selector)}).First)" +
-                             $".ToHaveValueAsync({Literal(spec.Expected)});";
+                yield return $"await Expect(Page.Locator({Literal(spec.Selector)}).First)";
+                yield return $"    .ToHaveValueAsync({expected});";
                 break;
 
             case AssertionKinds.ElementEnabled:
@@ -270,6 +276,30 @@ internal static class CodeGen
                 yield return $"Assert.Fail({Literal($"Unknown assertion kind: {spec.Kind}")});";
                 break;
         }
+    }
+
+    /// <summary>
+    /// The same fallback the studio uses at run time: suggestion lists are
+    /// rebuilt every time they open, so their structural selectors go stale
+    /// while their wording does not.
+    /// </summary>
+    private static void AppendClickHelper(StringBuilder sb)
+    {
+        sb.AppendLine("    /// <summary>Clicks by selector, falling back to the text recorded for the element.</summary>");
+        sb.AppendLine("    private async Task ClickStepAsync(string selector, string fallbackText)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        try");
+        sb.AppendLine("        {");
+        sb.AppendLine("            await Page.Locator(selector).First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });");
+        sb.AppendLine("            return;");
+        sb.AppendLine("        }");
+        sb.AppendLine("        catch (Exception ex) when (ex is TimeoutException or PlaywrightException)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            if (string.IsNullOrWhiteSpace(fallbackText)) throw;");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine("        await Page.GetByText(fallbackText).First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });");
+        sb.AppendLine("    }");
     }
 
     /// <summary>A class name derived from the link, e.g. portal_uind_RightsPage.</summary>
@@ -315,6 +345,33 @@ internal static class CodeGen
         return name;
     }
 
+    /// <summary>Makes a local name unique within the method being written.</summary>
+    private static string UniqueLocal(HashSet<string> used, string name)
+    {
+        var candidate = name;
+        var n = 2;
+
+        while (!used.Add(candidate))
+        {
+            candidate = $"{name}{n++}";
+        }
+
+        return candidate;
+    }
+
+    /// <summary>A readable local name for the search box a step is driving.</summary>
+    private static string SearchVariable(TestStep step)
+    {
+        var name = Storage.Identifier(step.Label.Length > 0 ? step.Label : "search");
+
+        if (name.Length > 24)
+        {
+            name = name[..24];
+        }
+
+        return char.ToLowerInvariant(name[0]) + name[1..] + "Search";
+    }
+
     /// <summary>A C# string literal, quotes and backslashes escaped.</summary>
     private static string Literal(string value)
     {
@@ -354,6 +411,9 @@ internal static class CodeGen
         compiled by `PlaywrightTestStudio.csproj` (see the `Compile Remove` item
         in that file) because this app does not reference NUnit.
 
+        A test case with several data sets becomes one method with a `[TestCase]`
+        attribute per row, so `dotnet test` runs every row as its own test.
+
         To run them, create a test project once and point it at this folder:
 
             dotnet new nunit -n GeneratedTests.Runner
@@ -373,7 +433,7 @@ internal static class CodeGen
 
         Note that these fixtures use a fresh browser context, so any link behind
         a login needs a storage-state file or a sign-in step added to the
-        fixture. Inside the studio itself the shared browser profile handles it.
+        fixture. Inside the studio the shared browser profile handles it.
         """);
     }
 }

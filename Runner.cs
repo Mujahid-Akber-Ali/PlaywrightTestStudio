@@ -4,16 +4,67 @@ using Microsoft.Playwright;
 namespace PlaywrightTestStudio;
 
 /// <summary>
-/// Replays a saved test case with Playwright and decides pass or fail. This is
-/// the engine behind the Run buttons; the generated .cs file is the same
-/// scenario expressed for NUnit, kept in step but not executed from here.
+/// Replays a test case with Playwright and decides pass or fail. A case runs
+/// once per enabled data set, so one recorded session covers as many rows as
+/// somebody types into the Excel sheet.
 /// </summary>
 internal static class Runner
 {
+    /// <summary>
+    /// Runs every enabled data set and returns one result each. The summary is
+    /// written onto the test case: Passed only when every row passed.
+    /// </summary>
+    public static async Task<List<TestResult>> RunAllDataSetsAsync(
+        TestCase test,
+        ProjectStore store,
+        bool headless,
+        Action<string>? progress = null)
+    {
+        var sets = test.RunnableDataSets();
+        var results = new List<TestResult>();
+        var watch = Stopwatch.StartNew();
+
+        for (var i = 0; i < sets.Count; i++)
+        {
+            var set = sets[i];
+            var position = i + 1;
+
+            var result = await RunAsync(test, store, headless, set,
+                line => progress?.Invoke(sets.Count > 1
+                    ? $"[data set {position}/{sets.Count}: {set.Name}] {line}"
+                    : line));
+
+            results.Add(result);
+        }
+
+        watch.Stop();
+
+        var failed = results.Count(r => !r.IsPass);
+
+        test.LastResults = results;
+        test.LastResult = new TestResult
+        {
+            Status = failed == 0 ? "Passed" : results.Any(r => r.Status == "Error") ? "Error" : "Failed",
+            DataSet = sets.Count == 1 ? sets[0].Name : $"{sets.Count} data sets",
+            RanUtc = DateTime.UtcNow,
+            Seconds = Math.Round(watch.Elapsed.TotalSeconds, 2),
+            ScreenshotPath = results.FirstOrDefault(r => !r.IsPass)?.ScreenshotPath
+                             ?? results.FirstOrDefault()?.ScreenshotPath ?? "",
+            Message = failed == 0
+                ? $"All {results.Count} data set(s) passed."
+                : $"{failed} of {results.Count} data set(s) failed: " +
+                  string.Join("; ", results.Where(r => !r.IsPass).Select(r => $"{r.DataSet} - {r.Message}")),
+            Assertions = results.SelectMany(r => r.Assertions).ToList()
+        };
+
+        return results;
+    }
+
     public static async Task<TestResult> RunAsync(
         TestCase test,
         ProjectStore store,
         bool headless,
+        DataSet data,
         Action<string>? progress = null)
     {
         var watch = Stopwatch.StartNew();
@@ -21,6 +72,7 @@ internal static class Runner
         var result = new TestResult
         {
             RanUtc = DateTime.UtcNow,
+            DataSet = data.Name,
             Status = "Error"
         };
 
@@ -31,28 +83,25 @@ internal static class Runner
             progress?.Invoke("Starting browser...");
             session = await BrowserSession.StartAsync(headless);
 
+            var page = session.Page;
+
             progress?.Invoke($"Opening {test.Url}");
-            await session.Page.GotoAsync(test.Url, new PageGotoOptions
+            await page.GotoAsync(test.Url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+            await SettleAsync(page);
+
+            var step = 0;
+
+            foreach (var action in test.Steps.Where(s => s.Use))
             {
-                WaitUntil = WaitUntilState.DOMContentLoaded
-            });
+                step++;
+                var value = Resolve(action.Parameter, action.RecordedValue, data);
 
-            await SettleAsync(session.Page);
+                progress?.Invoke($"Step {step}: {Describe(action, value)}");
+                await ApplyAsync(page, action, value);
 
-            foreach (var field in test.Fields.Where(f => f.Use))
-            {
-                progress?.Invoke($"Entering \"{field.Label}\"");
-                await ApplyFieldAsync(session.Page, field);
-            }
-
-            foreach (var click in test.Clicks)
-            {
-                progress?.Invoke($"Clicking \"{click.Label}\"");
-                await session.Page.ClickAsync(click.Selector);
-
-                if (click.WaitAfter)
+                if (action.WaitAfter)
                 {
-                    await SettleAsync(session.Page);
+                    await SettleAsync(page);
                 }
             }
 
@@ -60,10 +109,11 @@ internal static class Runner
 
             foreach (var assertion in test.Assertions)
             {
-                result.Assertions.Add(await CheckAsync(session.Page, assertion));
+                var expected = Resolve(assertion.Parameter, assertion.Expected, data);
+                result.Assertions.Add(await CheckAsync(page, assertion, expected));
             }
 
-            result.ScreenshotPath = await CaptureAsync(session.Page, store, test);
+            result.ScreenshotPath = await CaptureAsync(page, store, test, data);
 
             var failed = result.Assertions.Count(a => !a.Passed);
 
@@ -92,8 +142,8 @@ internal static class Runner
             if (session is not null)
             {
                 // A screenshot of wherever the run stopped is usually the
-                // fastest way to see why a selector missed.
-                result.ScreenshotPath = await CaptureAsync(session.Page, store, test);
+                // fastest way to see why a step missed.
+                result.ScreenshotPath = await CaptureAsync(session.Page, store, test, data);
             }
         }
         finally
@@ -108,6 +158,170 @@ internal static class Runner
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// The value a step or assertion uses this run: the data set's column when
+    /// the step names one and the row has it, otherwise what was recorded.
+    /// </summary>
+    public static string Resolve(string parameter, string recorded, DataSet data)
+    {
+        if (parameter.Length > 0 && data.Values.TryGetValue(parameter, out var supplied))
+        {
+            return supplied;
+        }
+
+        return recorded;
+    }
+
+    public static string Describe(TestStep step, string value) => step.Action switch
+    {
+        StepActions.Goto => $"go to {value}",
+        StepActions.Fill => $"fill \"{step.Display}\" with \"{value}\"",
+        StepActions.Type => $"search \"{step.Display}\" for \"{value}\"",
+        StepActions.Select => $"choose \"{value}\" in \"{step.Display}\"",
+        StepActions.Check => $"tick \"{step.Display}\"",
+        StepActions.Uncheck => $"untick \"{step.Display}\"",
+        StepActions.Click => $"click \"{step.Display}\"",
+        StepActions.Press => $"press {value} in \"{step.Display}\"",
+        _ => $"{step.Action} {step.Display}"
+    };
+
+    private static async Task ApplyAsync(IPage page, TestStep step, string value)
+    {
+        switch (step.Action)
+        {
+            case StepActions.Goto:
+                await page.GotoAsync(value, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+                break;
+
+            case StepActions.Type:
+                await TypeAsync(page, step, value);
+                break;
+
+            case StepActions.Select:
+                await SelectOptionAsync(page, step, value);
+                break;
+
+            case StepActions.Check:
+                await page.Locator(step.Selector).First.CheckAsync();
+                break;
+
+            case StepActions.Uncheck:
+                await page.Locator(step.Selector).First.UncheckAsync();
+                break;
+
+            case StepActions.Click:
+                await ClickAsync(page, step, value);
+                break;
+
+            case StepActions.Press:
+                await page.Locator(step.Selector).First.PressAsync(value.Length > 0 ? value : "Enter");
+                break;
+
+            default:
+                await page.Locator(step.Selector).First.FillAsync(value);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Clicks by selector, falling back to the text the element showed when it
+    /// was recorded. Suggestion lists are rebuilt each time they open, so their
+    /// structural selectors go stale while their wording does not.
+    /// </summary>
+    private static async Task ClickAsync(IPage page, TestStep step, string fallbackText)
+    {
+        try
+        {
+            await page.Locator(step.Selector).First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+            return;
+        }
+        catch (Exception ex) when (ex is TimeoutException or PlaywrightException)
+        {
+            if (fallbackText.Trim().Length == 0)
+            {
+                throw;
+            }
+        }
+
+        await page.GetByText(fallbackText.Trim()).First
+            .ClickAsync(new LocatorClickOptions { Timeout = 10_000 });
+    }
+
+    /// <summary>
+    /// Types into a lookup one key at a time, because those widgets search on
+    /// key events and ignore a value that is simply assigned.
+    /// </summary>
+    private static async Task TypeAsync(IPage page, TestStep step, string value)
+    {
+        var input = page.Locator(step.Selector).First;
+
+        await input.ClickAsync();
+
+        try
+        {
+            await input.FillAsync("");
+        }
+        catch (PlaywrightException)
+        {
+            // Some widgets refuse an empty fill; typing over the top is fine.
+        }
+
+        await input.PressSequentiallyAsync(value, new LocatorPressSequentiallyOptions { Delay = 60 });
+
+        // Give the search a moment to answer before the next step tries to click
+        // whatever it produced.
+        await page.WaitForTimeoutAsync(600);
+    }
+
+    private static async Task SelectOptionAsync(IPage page, TestStep step, string value)
+    {
+        var locator = page.Locator(step.Selector).First;
+
+        // Widgets like select2 and chosen hide the real <select> and draw their
+        // own box over it. Playwright cannot click what is hidden, so set the
+        // value in the DOM and raise the events the page is listening for.
+        if (!await locator.IsVisibleAsync())
+        {
+            await SetHiddenSelectAsync(locator, value);
+            return;
+        }
+
+        try
+        {
+            await locator.SelectOptionAsync(new SelectOptionValue { Label = value });
+        }
+        catch (PlaywrightException)
+        {
+            await locator.SelectOptionAsync(new SelectOptionValue { Value = value });
+        }
+    }
+
+    private static async Task SetHiddenSelectAsync(ILocator select, string wanted)
+    {
+        await select.EvaluateAsync("""
+        (el, wanted) => {
+          const text = String(wanted).trim().toLowerCase();
+          const options = Array.prototype.slice.call(el.options);
+
+          const match = options.find(o => o.text.trim().toLowerCase() === text)
+                     || options.find(o => String(o.value).toLowerCase() === text)
+                     || options.find(o => o.text.trim().toLowerCase().indexOf(text) >= 0);
+
+          if (!match) {
+            throw new Error('No option matching "' + wanted + '". Options: ' +
+              options.map(o => o.text.trim()).join(' | '));
+          }
+
+          el.value = match.value;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+
+          // Enhanced widgets usually redraw on a jQuery change.
+          if (window.jQuery) { window.jQuery(el).trigger('change'); }
+        }
+        """, wanted);
     }
 
     /// <summary>
@@ -150,203 +364,12 @@ internal static class Runner
         }
     }
 
-    private static async Task ApplyFieldAsync(IPage page, FieldValue field)
-    {
-        switch (field.Kind)
-        {
-            case "select":
-                await SelectOptionAsync(page, field);
-                break;
-
-            case "search":
-                await SearchAndPickAsync(page, field);
-                break;
-
-            case "radio":
-                await page.CheckAsync(field.Selector);
-                break;
-
-            case "checkbox":
-                await page.SetCheckedAsync(field.Selector, IsTruthy(field.Value));
-                break;
-
-            default:
-                await page.FillAsync(field.Selector, field.Value);
-                break;
-        }
-    }
-
-    /// <summary>
-    /// Selects by visible label first, because that is what the operator picked
-    /// in the data popup; falls back to the option's value attribute.
-    /// </summary>
-    private static async Task SelectOptionAsync(IPage page, FieldValue field)
-    {
-        var locator = page.Locator(field.Selector).First;
-
-        // Widgets like select2 and chosen hide the real <select> and draw their
-        // own box over it. Playwright cannot click what is hidden, so set the
-        // value in the DOM and raise the events the page is listening for.
-        if (!await locator.IsVisibleAsync())
-        {
-            await SetHiddenSelectAsync(locator, field.Value);
-            return;
-        }
-
-        try
-        {
-            await page.SelectOptionAsync(field.Selector, new SelectOptionValue { Label = field.Value });
-        }
-        catch (PlaywrightException)
-        {
-            await page.SelectOptionAsync(field.Selector, new SelectOptionValue { Value = field.Value });
-        }
-    }
-
-    private static async Task SetHiddenSelectAsync(ILocator select, string wanted)
-    {
-        await select.EvaluateAsync("""
-        (el, wanted) => {
-          const text = String(wanted).trim().toLowerCase();
-          const options = Array.prototype.slice.call(el.options);
-
-          const match = options.find(o => o.text.trim().toLowerCase() === text)
-                     || options.find(o => String(o.value).toLowerCase() === text)
-                     || options.find(o => o.text.trim().toLowerCase().indexOf(text) >= 0);
-
-          if (!match) {
-            throw new Error('No option matching "' + wanted + '". Options: ' +
-              options.map(o => o.text.trim()).join(' | '));
-          }
-
-          el.value = match.value;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-
-          // Enhanced widgets usually redraw on a jQuery change.
-          if (window.jQuery) { window.jQuery(el).trigger('change'); }
-        }
-        """, wanted);
-    }
-
-    /// <summary>
-    /// Drives a type-ahead the way a person does: type into it, wait for the
-    /// search to come back, then click the result. Keystrokes are sent one at a
-    /// time because most lookup widgets listen for key events and ignore a
-    /// value that is simply assigned.
-    /// </summary>
-    private static async Task SearchAndPickAsync(IPage page, FieldValue field)
-    {
-        var input = page.Locator(field.Selector).First;
-
-        await input.ClickAsync();
-
-        try
-        {
-            await input.FillAsync("");
-        }
-        catch (PlaywrightException)
-        {
-            // Some widgets refuse an empty fill; typing over the top is fine.
-        }
-
-        await input.PressSequentiallyAsync(field.Value, new LocatorPressSequentiallyOptions { Delay = 60 });
-
-        var wanted = field.Pick.Trim().Length > 0 ? field.Pick.Trim() : "";
-
-        foreach (var (candidate, timeout) in ResultCandidates(page, field, wanted))
-        {
-            try
-            {
-                await candidate.First.ClickAsync(new LocatorClickOptions { Timeout = timeout });
-                return;
-            }
-            catch (TimeoutException)
-            {
-                // Try the next shape of suggestion list.
-            }
-            catch (PlaywrightException)
-            {
-            }
-        }
-
-        if (wanted.Length == 0)
-        {
-            // No specific item was asked for and nothing clickable was found:
-            // most lookups still answer to the keyboard.
-            await input.PressAsync("ArrowDown");
-            await input.PressAsync("Enter");
-            return;
-        }
-
-        throw new InvalidOperationException(
-            $"Typed \"{field.Value}\" into \"{field.Label}\" but no search result matching " +
-            $"\"{wanted}\" appeared.\r\n" +
-            "Check the wording of the item, or give the field longer to search.");
-    }
-
-    /// <summary>
-    /// The suggestion-list shapes worth trying, most specific first. The first
-    /// one gets the long timeout because that is the wait for the search itself;
-    /// by the time it gives up, the results are either there or never coming.
-    /// </summary>
-    private static IEnumerable<(ILocator Locator, float Timeout)> ResultCandidates(
-        IPage page, FieldValue field, string wanted)
-    {
-        var filter = wanted.Length > 0 ? new LocatorFilterOptions { HasTextString = wanted } : null;
-
-        ILocator Narrow(ILocator locator) => filter is null ? locator : locator.Filter(filter);
-
-        var container = field.ResultsSelector.Trim();
-        var first = true;
-
-        float Next()
-        {
-            var timeout = first ? 10_000f : 1_500f;
-            first = false;
-            return timeout;
-        }
-
-        if (container.Length > 0)
-        {
-            yield return (Narrow(page.Locator($"{container} [role=option], {container} li, {container} option")), Next());
-            yield return (Narrow(page.Locator($"{container} tr, {container} a, {container} div")), Next());
-        }
-
-        if (wanted.Length > 0)
-        {
-            yield return (page.GetByRole(AriaRole.Option, new PageGetByRoleOptions { Name = wanted }), Next());
-        }
-        else
-        {
-            yield return (page.GetByRole(AriaRole.Option), Next());
-        }
-
-        // The containers the common lookup widgets render into.
-        yield return (Narrow(page.Locator(
-            "[role=listbox] [role=option], " +
-            "ul.ui-autocomplete li, " +
-            ".select2-results__option, " +
-            ".tt-suggestion, " +
-            ".typeahead__item, " +
-            ".autocomplete-suggestion, " +
-            ".autocomplete-items div, " +
-            ".dropdown-menu li, " +
-            ".dropdown-menu a")), Next());
-
-        if (wanted.Length > 0)
-        {
-            // Last resort: anything visible on the page saying what we want.
-            yield return (page.GetByText(wanted), Next());
-        }
-    }
-
     public static bool IsTruthy(string value) =>
         value.Trim().ToLowerInvariant() is "true" or "yes" or "1" or "checked" or "on";
 
-    private static async Task<AssertionResult> CheckAsync(IPage page, AssertionSpec spec)
+    private static async Task<AssertionResult> CheckAsync(IPage page, AssertionSpec spec, string expected)
     {
-        var outcome = new AssertionResult { Description = Describe(spec) };
+        var outcome = new AssertionResult { Description = Describe(spec, expected) };
 
         try
         {
@@ -354,12 +377,12 @@ internal static class Runner
             {
                 case AssertionKinds.UrlContains:
                     outcome.Actual = page.Url;
-                    outcome.Passed = Contains(page.Url, spec.Expected);
+                    outcome.Passed = Contains(page.Url, expected);
                     break;
 
                 case AssertionKinds.TitleContains:
                     outcome.Actual = await page.TitleAsync();
-                    outcome.Passed = Contains(outcome.Actual, spec.Expected);
+                    outcome.Passed = Contains(outcome.Actual, expected);
                     break;
 
                 case AssertionKinds.PageTextContains:
@@ -368,8 +391,8 @@ internal static class Runner
                     var text = await page.EvaluateAsync<string>(
                         "() => document.body ? document.body.innerText : ''") ?? "";
 
-                    outcome.Actual = Excerpt(text, spec.Expected);
-                    var hit = Contains(text, spec.Expected);
+                    outcome.Actual = Excerpt(text, expected);
+                    var hit = Contains(text, expected);
                     outcome.Passed = spec.Kind == AssertionKinds.PageTextContains ? hit : !hit;
                     break;
                 }
@@ -401,12 +424,12 @@ internal static class Runner
 
                 case AssertionKinds.ElementTextContains:
                     outcome.Actual = (await page.Locator(spec.Selector).First.InnerTextAsync()) ?? "";
-                    outcome.Passed = Contains(outcome.Actual, spec.Expected);
+                    outcome.Passed = Contains(outcome.Actual, expected);
                     break;
 
                 case AssertionKinds.ElementValueEquals:
                     outcome.Actual = (await page.Locator(spec.Selector).First.InputValueAsync()) ?? "";
-                    outcome.Passed = string.Equals(outcome.Actual.Trim(), spec.Expected.Trim(),
+                    outcome.Passed = string.Equals(outcome.Actual.Trim(), expected.Trim(),
                         StringComparison.OrdinalIgnoreCase);
                     break;
 
@@ -445,12 +468,13 @@ internal static class Runner
         return outcome;
     }
 
-    public static string Describe(AssertionSpec spec)
+    public static string Describe(AssertionSpec spec, string? expected = null)
     {
         var target = AssertionKinds.NeedsSelector(spec.Kind) ? $" [{spec.Selector}]" : "";
-        var expected = AssertionKinds.NeedsExpected(spec.Kind) ? $" \"{spec.Expected}\"" : "";
+        var wanted = expected ?? spec.Expected;
+        var value = AssertionKinds.NeedsExpected(spec.Kind) ? $" \"{wanted}\"" : "";
 
-        return $"{spec.Kind}{target}{expected}";
+        return $"{spec.Kind}{target}{value}";
     }
 
     private static bool Contains(string haystack, string needle) =>
@@ -461,7 +485,7 @@ internal static class Runner
     private static string Excerpt(string text, string needle)
     {
         var flat = text.Replace("\r", " ").Replace("\n", " ");
-        var at = flat.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
+        var at = needle.Length > 0 ? flat.IndexOf(needle, StringComparison.OrdinalIgnoreCase) : -1;
 
         if (at < 0)
         {
@@ -474,14 +498,16 @@ internal static class Runner
         return "..." + flat.Substring(start, length) + "...";
     }
 
-    private static async Task<string> CaptureAsync(IPage page, ProjectStore store, TestCase test)
+    private static async Task<string> CaptureAsync(IPage page, ProjectStore store, TestCase test, DataSet data)
     {
         try
         {
             Directory.CreateDirectory(store.ScreenshotsDir);
 
+            var suffix = data.Name.Length > 0 ? "_" + Storage.Slug(data.Name) : "";
+
             var file = Path.Combine(store.ScreenshotsDir,
-                $"{Storage.Slug(test.Name)}_{DateTime.Now:yyyyMMdd_HHmmss}.png");
+                $"{Storage.Slug(test.Name)}{suffix}_{DateTime.Now:yyyyMMdd_HHmmss}.png");
 
             await page.ScreenshotAsync(new PageScreenshotOptions { Path = file, FullPage = true });
 

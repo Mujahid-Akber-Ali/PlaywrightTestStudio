@@ -18,13 +18,22 @@ internal sealed class BrowserSession : IAsyncDisposable
     /// Starts a session. The first call may download Chromium, which is why the
     /// caller is expected to show a wait cursor around it.
     /// </summary>
-    public static async Task<BrowserSession> StartAsync(bool headless)
+    /// <summary>
+    /// Playwright itself, with the browser download taken care of. Callers that
+    /// need their own context options - the recorder, for one - start here.
+    /// </summary>
+    public static async Task<IPlaywright> CreatePlaywrightAsync()
     {
         EnsureBrowsersInstalled();
-
         Directory.CreateDirectory(Storage.ProfileDir);
 
-        var playwright = await Microsoft.Playwright.Playwright.CreateAsync();
+        return await Microsoft.Playwright.Playwright.CreateAsync();
+    }
+
+    public static async Task<BrowserSession> StartAsync(bool headless)
+    {
+
+        var playwright = await CreatePlaywrightAsync();
 
         IBrowserContext context;
 

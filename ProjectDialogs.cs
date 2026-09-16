@@ -126,14 +126,21 @@ internal static class ProjectDialogs
     /// Asks for the link to scan. Also offers a sign-in trip, because the
     /// scanner sees whatever the shared browser profile is allowed to see.
     /// </summary>
-    public static string? AskLink(IWin32Window owner, string? suggested = null)
+    public static string? AskLink(IWin32Window owner, string? suggested = null, string purpose = "scan")
     {
+        var recording = purpose == "record";
+
         using var form = Ui.NewForm($"{Ui.AppTitle} - Link", 560, 276);
 
-        form.Controls.Add(Ui.Title("Which page do you want to test?"));
-        form.Controls.Add(Ui.Hint(
-            "Paste the full link. The tool opens it and lists every dropdown, " +
-            "text field, radio button and button it finds.", 22, 46, 500));
+        form.Controls.Add(Ui.Title(recording
+            ? "Which page do you want to record on?"
+            : "Which page do you want to test?"));
+
+        form.Controls.Add(Ui.Hint(recording
+            ? "Paste the full link. The page opens in a browser and everything you do there is recorded " +
+              "as a test case."
+            : "Paste the full link. The tool opens it and lists every dropdown, " +
+              "text field, radio button and button it finds.", 22, 46, 500));
 
         var input = new TextBox
         {
@@ -148,7 +155,7 @@ internal static class ProjectDialogs
             "scan and every later run stay signed in.", 22, 136, 500);
 
         var login = Ui.Secondary("Sign in first...", 20, 186, 130);
-        var scan = Ui.Primary("Scan page", 296, 186, 120);
+        var scan = Ui.Primary(recording ? "Start recording" : "Scan page", 276, 186, 140);
         var cancel = Ui.Secondary("Cancel", 424, 186, 112);
 
         login.Click += (_, _) =>

@@ -118,11 +118,10 @@ internal static class ScanDialogs
     /// Asks for the data to enter. The fields are exactly the ones the scan
     /// found, with dropdowns and radio groups reduced to a pick list.
     /// </summary>
-    public static (List<FieldValue> Fields, List<ClickStep> Clicks)? AskData(
+    public static List<TestStep>? AskData(
         IWin32Window owner,
         string url,
-        IReadOnlyList<ElementInfo> elements,
-        TestCase? existing = null)
+        IReadOnlyList<ElementInfo> elements)
     {
         using var form = Ui.NewForm($"{Ui.AppTitle} - Test data", 940, 660, resizable: true);
 
@@ -169,7 +168,7 @@ internal static class ScanDialogs
             }
         };
 
-        BuildFieldRows(fieldGrid, elements, existing);
+        BuildFieldRows(fieldGrid, elements);
 
         var buttonsLabel = Ui.Hint("Buttons to press, in order", 20, 396);
         buttonsLabel.Font = Ui.Bold;
@@ -187,7 +186,7 @@ internal static class ScanDialogs
             AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill
         });
 
-        BuildClickRows(clickGrid, elements, existing);
+        BuildClickRows(clickGrid, elements);
 
         var up = Ui.Secondary("Move up", 20, 578, 92);
         var down = Ui.Secondary("Move down", 118, 578, 100);
@@ -242,15 +241,110 @@ internal static class ScanDialogs
         form.CancelButton = cancel;
 
         return form.ShowDialog(owner) == DialogResult.OK && fields is not null && clicks is not null
-            ? (fields, clicks)
+            ? ToSteps(fields, clicks)
             : null;
+    }
+
+    /// <summary>
+    /// Turns what the scan dialog collected into the ordered step list the rest
+    /// of the tool runs: every field in page order, then the buttons. A search
+    /// field becomes two steps - type, then click the result - which is what it
+    /// always meant.
+    /// </summary>
+    private static List<TestStep> ToSteps(List<FieldValue> fields, List<ClickStep> clicks)
+    {
+        var steps = new List<TestStep>();
+
+        foreach (var field in fields)
+        {
+            switch (field.Kind)
+            {
+                case "search":
+                    steps.Add(new TestStep
+                    {
+                        Action = StepActions.Type,
+                        Selector = field.Selector,
+                        Label = field.Label,
+                        Value = field.Value
+                    });
+
+                    if (field.Pick.Trim().Length > 0)
+                    {
+                        var scope = field.ResultsSelector.Trim();
+
+                        steps.Add(new TestStep
+                        {
+                            Action = StepActions.Click,
+                            Selector = scope.Length > 0
+                                ? $"{scope} [role=option], {scope} li, {scope} option"
+                                : "[role=option]",
+                            Label = $"{field.Label} result",
+                            FallbackText = field.Pick.Trim()
+                        });
+                    }
+
+                    break;
+
+                case "select":
+                    steps.Add(new TestStep
+                    {
+                        Action = StepActions.Select,
+                        Selector = field.Selector,
+                        Label = field.Label,
+                        Value = field.Value
+                    });
+                    break;
+
+                case "radio":
+                    steps.Add(new TestStep
+                    {
+                        Action = StepActions.Check,
+                        Selector = field.Selector,
+                        Label = field.Label
+                    });
+                    break;
+
+                case "checkbox":
+                    steps.Add(new TestStep
+                    {
+                        Action = Runner.IsTruthy(field.Value) ? StepActions.Check : StepActions.Uncheck,
+                        Selector = field.Selector,
+                        Label = field.Label
+                    });
+                    break;
+
+                default:
+                    steps.Add(new TestStep
+                    {
+                        Action = StepActions.Fill,
+                        Selector = field.Selector,
+                        Label = field.Label,
+                        Value = field.Value
+                    });
+                    break;
+            }
+        }
+
+        foreach (var click in clicks)
+        {
+            steps.Add(new TestStep
+            {
+                Action = StepActions.Click,
+                Selector = click.Selector,
+                Label = click.Label,
+                FallbackText = click.Label,
+                WaitAfter = click.WaitAfter
+            });
+        }
+
+        return steps;
     }
 
     /// <summary>
     /// One row per fillable control, with radio buttons that share a name
     /// folded into a single pick list.
     /// </summary>
-    private static void BuildFieldRows(DataGridView grid, IReadOnlyList<ElementInfo> elements, TestCase? existing)
+    private static void BuildFieldRows(DataGridView grid, IReadOnlyList<ElementInfo> elements)
     {
         var handledGroups = new HashSet<string>(StringComparer.Ordinal);
 
@@ -269,28 +363,29 @@ internal static class ScanDialogs
                 }
 
                 var group = elements.Where(e => e.Kind == "radio" && e.Name == element.Name).ToList();
-                AddRadioGroupRow(grid, element.Name, group, existing);
+                AddRadioGroupRow(grid, element.Name, group);
                 continue;
             }
 
-            AddFieldRow(grid, element, existing);
+            AddFieldRow(grid, element);
         }
     }
 
     private static void AddRadioGroupRow(DataGridView grid, string groupName,
-        List<ElementInfo> group, TestCase? existing)
+        List<ElementInfo> group)
     {
         var label = group.FirstOrDefault(e => e.Label.Length > 0)?.Label ?? groupName;
-        var saved = existing?.Fields.FirstOrDefault(f => f.Kind == "radio" && f.Group == groupName);
+        // A fresh scan has nothing to prefill from; editing a saved case is done
+        // in the steps editor instead.
 
-        var index = grid.Rows.Add(saved?.Use ?? false, "radio", $"{label}  ({groupName})", "", "", "");
+        var index = grid.Rows.Add(false, "radio", $"{label}  ({groupName})", "", "", "");
         var row = grid.Rows[index];
 
         var options = group.Select(OptionLabel).ToList();
-        var cell = NewComboCell(options, saved?.Value ?? options.FirstOrDefault() ?? "");
+        var cell = NewComboCell(options, options.FirstOrDefault() ?? "");
 
         row.Cells["Value"] = cell;
-        row.Cells["Selector"].Value = saved?.Selector ?? group[0].Selector;
+        row.Cells["Selector"].Value = group[0].Selector;
         row.Cells["Selector"].Style.Font = Ui.Mono;
         row.Cells["Type"].ReadOnly = true;
 
@@ -304,16 +399,14 @@ internal static class ScanDialogs
         };
     }
 
-    private static void AddFieldRow(DataGridView grid, ElementInfo element, TestCase? existing)
+    private static void AddFieldRow(DataGridView grid, ElementInfo element)
     {
-        var saved = existing?.Fields.FirstOrDefault(f => f.Selector == element.Selector);
+        // Values start empty: this dialog only ever runs on a fresh scan.
+        // Changing a saved case is done in the steps editor.
+        var kind = element.Kind;
 
-        // A saved case wins over the scan: the operator may already have
-        // corrected a field the scanner read as plain text.
-        var kind = saved?.Kind ?? element.Kind;
-
-        var index = grid.Rows.Add(saved?.Use ?? element.Visible, KindLabel(kind),
-            element.Display, "", saved?.Pick ?? "", element.Selector);
+        var index = grid.Rows.Add(element.Visible, KindLabel(kind),
+            element.Display, "", "", element.Selector);
 
         var row = grid.Rows[index];
         row.Cells["Selector"].Style.Font = Ui.Mono;
@@ -334,14 +427,14 @@ internal static class ScanDialogs
             case "select":
             {
                 var options = element.Options.Count > 0 ? element.Options : new List<string> { "" };
-                row.Cells["Value"] = NewComboCell(options, saved?.Value ?? options[0]);
+                row.Cells["Value"] = NewComboCell(options, options[0]);
                 break;
             }
 
             case "checkbox":
             {
                 var options = new List<string> { "true", "false" };
-                row.Cells["Value"] = NewComboCell(options, saved?.Value ?? "true");
+                row.Cells["Value"] = NewComboCell(options, "true");
                 break;
             }
 
@@ -354,7 +447,7 @@ internal static class ScanDialogs
             }
 
             default:
-                row.Cells["Value"].Value = saved?.Value ?? "";
+                row.Cells["Value"].Value = "";
                 break;
         }
 
@@ -370,9 +463,7 @@ internal static class ScanDialogs
             Label = element.Display,
             Selector = element.Selector,
             Group = element.Name,
-            ResultsSelector = saved?.ResultsSelector is { Length: > 0 } saveds
-                ? saveds
-                : element.ResultsSelector
+            ResultsSelector = element.ResultsSelector
         };
 
         SyncSearchRow(row);
@@ -401,25 +492,9 @@ internal static class ScanDialogs
             : "";
     }
 
-    private static void BuildClickRows(DataGridView grid, IReadOnlyList<ElementInfo> elements, TestCase? existing)
+    private static void BuildClickRows(DataGridView grid, IReadOnlyList<ElementInfo> elements)
     {
         var buttons = elements.Where(e => e.Kind == "button").ToList();
-
-        // Keep a previously saved order at the top, so reopening a test case
-        // shows the click sequence it actually runs.
-        if (existing is not null)
-        {
-            foreach (var click in existing.Clicks)
-            {
-                var match = buttons.FirstOrDefault(b => b.Selector == click.Selector);
-
-                if (match is not null)
-                {
-                    buttons.Remove(match);
-                    AddClickRow(grid, match, use: true, wait: click.WaitAfter);
-                }
-            }
-        }
 
         foreach (var button in buttons)
         {

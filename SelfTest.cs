@@ -1,11 +1,14 @@
 using System.Text;
+using ClosedXML.Excel;
 
 namespace PlaywrightTestStudio;
 
 /// <summary>
-/// End-to-end check of the engine with no UI in the way: build a page, scan it,
-/// fill it, run it, and read back the generated C# file. Run with
-/// <c>PlaywrightTestStudio.exe --selftest</c>; the log lands in %TEMP%.
+/// End-to-end check of the engine with no UI in the way. It walks the whole
+/// journey the tool is for: record a session, download the workbook, add a row
+/// of test data the way a tester would, upload it, and run every row.
+///
+/// Run with <c>PlaywrightTestStudio.exe --selftest</c>; the log lands in %TEMP%.
 /// </summary>
 internal static class SelfTest
 {
@@ -27,6 +30,8 @@ internal static class SelfTest
         }
 
         var logFile = Path.Combine(Path.GetTempPath(), "playwright-test-studio-selftest.log");
+        var store = Storage.OpenProject(ProjectName);
+        var workbook = Path.Combine(Path.GetTempPath(), "pts-selftest-book.xlsx");
 
         try
         {
@@ -35,101 +40,182 @@ internal static class SelfTest
 
             log.AppendLine($"Sample page : {pageFile}");
 
-            var elements = Scanner.ScanAsync(url, headless: true).GetAwaiter().GetResult();
+            // ---------------------------------------------------------------
+            // 1. Record a session, driving the page the way a person would.
+            // ---------------------------------------------------------------
+            var test = RecordAsync(url, store, log).GetAwaiter().GetResult();
 
-            log.AppendLine($"Scanned     : {elements.Count} control(s)");
+            log.AppendLine($"Recorded    : {test.Steps.Count} step(s)");
 
-            foreach (var element in elements)
+            foreach (var step in test.Steps)
             {
-                log.AppendLine($"              {element.Kind,-9} {element.Selector,-34} {element.Display}");
+                log.AppendLine($"              {step.Action,-7} {step.Selector,-30} " +
+                               $"value=\"{step.RecordedValue}\"  param={step.Parameter}");
             }
 
-            Check("one dropdown found", elements.Count(e => e.Kind == "select") == 1);
-            Check("two text fields found", elements.Count(e => e.Kind == "text") == 2,
-                $"got {elements.Count(e => e.Kind == "text")}");
+            Check("typing was recorded", test.Steps.Any(s => s.Action == StepActions.Fill && s.Selector == "#username"));
+            Check("the dropdown choice was recorded",
+                test.Steps.Any(s => s.Action == StepActions.Select && s.Selector == "#role"));
+            Check("the radio button was recorded",
+                test.Steps.Any(s => s.Action == StepActions.Check && s.Selector.Contains("plan")));
+            Check("the checkbox was recorded",
+                test.Steps.Any(s => s.Action == StepActions.Check && s.Selector == "#terms"));
+            Check("the item lookup was recorded as a type-ahead, not a plain fill",
+                test.Steps.Any(s => s.Action == StepActions.Type && s.Selector == "#itemSearch"));
+            Check("picking the search result was recorded",
+                test.Steps.Any(s => s.Action == StepActions.Click && s.FallbackText.Contains("Widget clamp")));
+            Check("the submit click was recorded",
+                test.Steps.Any(s => s.Action == StepActions.Click && s.Selector == "#submit"));
+            Check("keystrokes collapsed into one step per field",
+                test.Steps.Count(s => s.Selector == "#username") == 1,
+                $"{test.Steps.Count(s => s.Selector == "#username")} step(s) for #username");
 
-            var search = elements.FirstOrDefault(e => e.Kind == "search");
-            Check("the item lookup is read as a search field, not a text box or dropdown",
-                search is not null && search.Selector == "#itemSearch",
-                search?.Selector ?? "none found");
-            Check("the search field knows where its results appear",
-                search?.ResultsSelector == "#itemResults", search?.ResultsSelector ?? "");
-            Check("two radio buttons found", elements.Count(e => e.Kind == "radio") == 2,
-                $"got {elements.Count(e => e.Kind == "radio")}");
-            Check("one checkbox found", elements.Count(e => e.Kind == "checkbox") == 1);
-            Check("one button found", elements.Count(e => e.Kind == "button") == 1,
-                $"got {elements.Count(e => e.Kind == "button")}");
+            var parameters = test.Parameters();
+            log.AppendLine($"Parameters  : {string.Join(", ", parameters)}");
 
-            var role = elements.First(e => e.Kind == "select");
-            Check("dropdown options read", role.Options.Contains("Manager"),
-                string.Join("|", role.Options));
+            Check("every typed value became a data column", parameters.Count == 4,
+                string.Join(", ", parameters));
+            Check("the picked result is named after its field, not its value",
+                parameters.Any(p => p.StartsWith("item", StringComparison.OrdinalIgnoreCase) && p.Contains("result", StringComparison.OrdinalIgnoreCase)),
+                string.Join(", ", parameters));
+            Check("pressing a button did NOT become a data column",
+                !parameters.Any(p => p.Contains("submit", StringComparison.OrdinalIgnoreCase)),
+                string.Join(", ", parameters));
+            Check("the recorded values became the first data row",
+                test.DataSets.Count == 1 && test.DataSets[0].Values.Count == 4);
 
-            var pro = elements.First(e => e.Kind == "radio" && e.Value == "pro");
-            Check("radio label read from wrapping label", pro.Label.Contains("Pro"), pro.Label);
+            // ---------------------------------------------------------------
+            // 2. Assertions, including one that varies per data row.
+            // ---------------------------------------------------------------
+            var expectedColumn = "expectedResult";
 
-            var store = Storage.OpenProject(ProjectName);
-
-            var test = new TestCase
-            {
-                Name = "Submit the sample form",
-                Url = url,
-                Elements = elements,
-                Fields = new List<FieldValue>
-                {
-                    new() { Kind = "text", Selector = "#username", Value = "saif", Label = "User name" },
-                    new() { Kind = "select", Selector = "#role", Value = "Manager", Label = "Role" },
-                    new() { Kind = "radio", Selector = pro.Selector, Value = pro.Label, Group = "plan", Label = "Plan" },
-                    new() { Kind = "checkbox", Selector = "#terms", Value = "true", Label = "Terms" },
-                    new()
-                    {
-                        Kind = "search",
-                        Selector = "#itemSearch",
-                        Label = "Item",
-                        Value = "widget",
-                        Pick = "Widget clamp",
-                        ResultsSelector = search?.ResultsSelector ?? ""
-                    }
-                },
-                Clicks = new List<ClickStep>
-                {
-                    new() { Label = "Submit", Selector = "#submit", WaitAfter = false }
-                },
-                Assertions = new List<AssertionSpec>
-                {
-                    new() { Kind = AssertionKinds.PageTextContains, Expected = "Submitted: saif / Manager / pro / true / Widget clamp" },
-                    new() { Kind = AssertionKinds.ElementValueEquals, Selector = "#itemSearch", Expected = "Widget clamp" },
-                    new() { Kind = AssertionKinds.ElementVisible, Selector = "#result" },
-                    new() { Kind = AssertionKinds.ElementValueEquals, Selector = "#username", Expected = "saif" }
-                }
-            };
-
-            var result = Runner.RunAsync(test, store, headless: true).GetAwaiter().GetResult();
-
-            log.AppendLine($"Run status  : {result.Status} in {result.Seconds}s - {result.Message}");
-
-            foreach (var assertion in result.Assertions)
-            {
-                log.AppendLine($"              {(assertion.Passed ? "ok  " : "FAIL")} {assertion.Description}  actual: {assertion.Actual}");
-            }
-
-            Check("the happy path run passes, type-ahead included", result.IsPass, result.Message);
-            Check("a screenshot was captured", File.Exists(result.ScreenshotPath));
-
-            // Now break one assertion and confirm the run reports Failed rather
-            // than quietly passing.
             test.Assertions.Add(new AssertionSpec
             {
                 Kind = AssertionKinds.PageTextContains,
-                Expected = "this text is definitely not on the page"
+                Parameter = expectedColumn,
+                Expected = "Submitted: saif / Manager / pro / true / Widget clamp"
             });
 
-            var negative = Runner.RunAsync(test, store, headless: true).GetAwaiter().GetResult();
+            test.Assertions.Add(new AssertionSpec
+            {
+                Kind = AssertionKinds.ElementVisible,
+                Selector = "#result"
+            });
 
-            Check("a wrong assertion fails the run", negative.Status == "Failed", negative.Status);
+            RecordDialogs.SyncRecordedRow(test);
+            store.Save(test);
+            TestCaseDialogs.RegenerateCode(store, test);
 
-            test.Assertions.RemoveAt(test.Assertions.Count - 1);
+            Check("the parameterised check got a column on the recorded row",
+                test.DataSets[0].Values.ContainsKey(expectedColumn));
 
-            var codeFile = CodeGen.WriteForLink(store, url, new[] { test });
+            // ---------------------------------------------------------------
+            // 3. Run the recorded row.
+            // ---------------------------------------------------------------
+            var first = Runner.RunAllDataSetsAsync(test, store, headless: true).GetAwaiter().GetResult();
+
+            log.AppendLine($"First run   : {first[0].Status} in {first[0].Seconds}s - {first[0].Message}");
+
+            foreach (var assertion in first[0].Assertions)
+            {
+                log.AppendLine($"              {(assertion.Passed ? "ok  " : "FAIL")} {assertion.Description}");
+            }
+
+            Check("the recorded session replays and passes", first.Count == 1 && first[0].IsPass, first[0].Message);
+
+            // ---------------------------------------------------------------
+            // 4. Download the workbook.
+            // ---------------------------------------------------------------
+            ExcelBook.Export(store, new[] { test }, workbook);
+
+            Check("the workbook was written", File.Exists(workbook));
+
+            using (var book = new XLWorkbook(workbook))
+            {
+                var names = book.Worksheets.Select(w => w.Name).ToList();
+                log.AppendLine($"Sheets      : {string.Join(", ", names)}");
+
+                Check("the workbook explains itself", names.Contains("How to use"));
+                Check("it has a Test Cases sheet", names.Contains("Test Cases"));
+                Check("it has a Steps sheet", names.Contains("Steps"));
+                Check("it has an Assertions sheet", names.Contains("Assertions"));
+                Check("it has a Results sheet", names.Contains("Results"));
+                Check("it has a data sheet for the test case", names.Any(n => n.StartsWith("Data")));
+            }
+
+            // ---------------------------------------------------------------
+            // 5. A tester adds a second row of data by hand.
+            // ---------------------------------------------------------------
+            AddDataRow(workbook, test, expectedColumn, log);
+
+            // ---------------------------------------------------------------
+            // 6. Upload it again.
+            // ---------------------------------------------------------------
+            var report = ExcelBook.Import(store, workbook);
+
+            log.AppendLine($"Import      : {report.Summary}");
+
+            foreach (var problem in report.Problems)
+            {
+                log.AppendLine($"              problem: {problem}");
+            }
+
+            Check("the upload reported no problems", report.Problems.Count == 0,
+                string.Join("; ", report.Problems));
+            Check("the upload read one test case back", report.TestCases == 1);
+            Check("the upload added nothing unexpected", report.NewTestCases == 0);
+
+            var reloaded = store.LoadAll().Single(t => t.Id == test.Id);
+
+            Check("the second data row came through", reloaded.DataSets.Count == 2,
+                $"{reloaded.DataSets.Count} row(s)");
+            Check("the steps survived the round trip", reloaded.Steps.Count == test.Steps.Count,
+                $"{reloaded.Steps.Count} vs {test.Steps.Count}");
+            Check("the assertions survived the round trip", reloaded.Assertions.Count == 2);
+            Check("the per-row expected value survived",
+                reloaded.Assertions.Any(a => a.Parameter == expectedColumn));
+
+            // ---------------------------------------------------------------
+            // 7. Run both rows. Row two enters different data and expects a
+            //    different result, which is the whole point of the workbook.
+            // ---------------------------------------------------------------
+            var both = Runner.RunAllDataSetsAsync(reloaded, store, headless: true).GetAwaiter().GetResult();
+
+            log.AppendLine($"Data-driven : {both.Count} run(s)");
+
+            foreach (var result in both)
+            {
+                log.AppendLine($"              {result.Status,-6} [{result.DataSet}] {result.Message}");
+            }
+
+            Check("both data rows ran", both.Count == 2, $"{both.Count} run(s)");
+            Check("both data rows passed", both.All(r => r.IsPass),
+                string.Join(" | ", both.Where(r => !r.IsPass).Select(r => $"{r.DataSet}: {r.Message}")));
+            Check("each row was reported separately",
+                both.Select(r => r.DataSet).Distinct().Count() == 2);
+
+            store.Save(reloaded);
+            TestCaseDialogs.RegenerateCode(store, reloaded);
+
+            // A row that expects the wrong thing has to fail, or none of this
+            // proves anything.
+            reloaded.DataSets[1].Values[expectedColumn] = "this text is definitely not on the page";
+
+            var negative = Runner.RunAllDataSetsAsync(reloaded, store, headless: true).GetAwaiter().GetResult();
+
+            Check("a row expecting the wrong thing fails on its own",
+                negative[0].IsPass && !negative[1].IsPass,
+                $"row1={negative[0].Status}, row2={negative[1].Status}");
+            Check("one failing row fails the test case overall",
+                reloaded.LastResult?.Status == "Failed", reloaded.LastResult?.Status ?? "");
+
+            // ---------------------------------------------------------------
+            // 8. The generated C# reflects all of it.
+            // ---------------------------------------------------------------
+            reloaded.DataSets[1].Values[expectedColumn] = test.DataSets[0].Values[expectedColumn]
+                .Replace("saif", "ali").Replace("Manager", "Admin").Replace("Widget clamp", "Bolt M8");
+
+            var codeFile = CodeGen.WriteForLink(store, url, new[] { reloaded });
             var code = File.ReadAllText(codeFile);
 
             log.AppendLine($"Code file   : {codeFile}");
@@ -139,20 +225,18 @@ internal static class SelfTest
             log.AppendLine("--- end ---");
             log.AppendLine();
 
-            Check("generated file fills the text field", code.Contains("Page.FillAsync(\"#username\", \"saif\")"));
-            Check("generated file selects by label", code.Contains("SelectOptionAsync(\"#role\""));
-            Check("generated file checks the radio", code.Contains("Page.CheckAsync("));
-            Check("generated file sets the checkbox", code.Contains("SetCheckedAsync(\"#terms\", true)"));
-            Check("generated file clicks the button", code.Contains("Page.ClickAsync(\"#submit\")"));
-            Check("generated file types into the search field key by key",
-                code.Contains("PressSequentiallyAsync(\"widget\""));
-            Check("generated file picks the search result",
-                code.Contains("Widget clamp") && code.Contains("ClickAsync(new LocatorClickOptions"));
-            Check("generated file asserts", code.Contains("Assert.That(await Page.InnerTextAsync(\"body\")"));
-            Check("generated file is a fixture", code.Contains("[TestFixture]") && code.Contains("[Test]"));
+            Check("two data rows generate a parameterised NUnit test",
+                code.Contains("[TestCase(") && code.Contains("TestName ="));
+            Check("the generated test takes the data columns as parameters",
+                code.Contains($"string {parameters[0]}"));
+            Check("the generated test types into the lookup key by key",
+                code.Contains("PressSequentiallyAsync"));
+            Check("the generated test picks the result with a text fallback",
+                code.Contains("ClickStepAsync("));
+            Check("the generated fixture is valid NUnit shape",
+                code.Contains("[TestFixture]") && code.Contains(": PageTest"));
 
-            // Leave nothing behind: the throwaway project, its generated folder
-            // and the sample page all go.
+            // Cleanup.
             Storage.DeleteProject(ProjectName);
 
             if (Directory.Exists(store.CodeDir))
@@ -161,6 +245,7 @@ internal static class SelfTest
             }
 
             File.Delete(pageFile);
+            File.Delete(workbook);
         }
         catch (Exception ex)
         {
@@ -176,7 +261,90 @@ internal static class SelfTest
         return failures == 0 ? 0 : 1;
     }
 
-    /// <summary>A small page holding one of every control the scanner handles.</summary>
+    /// <summary>
+    /// Starts a recording and then drives the page with Playwright, which fires
+    /// exactly the events a person's mouse and keyboard would.
+    /// </summary>
+    private static async Task<TestCase> RecordAsync(string url, ProjectStore store, StringBuilder log)
+    {
+        var session = await RecordingSession.StartAsync(url, store.VideosDir, headless: true);
+        var page = session.Page;
+
+        await page.FillAsync("#username", "saif");
+        await page.SelectOptionAsync("#role", new Microsoft.Playwright.SelectOptionValue { Label = "Manager" });
+        await page.CheckAsync("input[name=\"plan\"][value=\"pro\"]");
+        await page.CheckAsync("#terms");
+
+        var search = page.Locator("#itemSearch");
+        await search.ClickAsync();
+        await search.PressSequentiallyAsync("widget", new Microsoft.Playwright.LocatorPressSequentiallyOptions { Delay = 40 });
+        await page.WaitForSelectorAsync("#itemResults li");
+        await page.GetByText("Widget clamp").ClickAsync();
+
+        await page.ClickAsync("#submit");
+
+        // The page talks to the recorder through an exposed function, so give
+        // the last events a moment to arrive before the browser is closed.
+        await page.WaitForTimeoutAsync(600);
+
+        log.AppendLine($"Recorder    : {session.Count} event(s) captured before stop");
+
+        return await session.StopAsync("Submit the sample form");
+    }
+
+    /// <summary>
+    /// Does to the workbook what a tester would do in Excel: copy the recorded
+    /// row, rename it, and change the values.
+    /// </summary>
+    private static void AddDataRow(string path, TestCase test, string expectedColumn, StringBuilder log)
+    {
+        using var book = new XLWorkbook(path);
+        var ws = book.Worksheets.First(w => w.Name.StartsWith("Data"));
+
+        var headers = new List<string>();
+
+        for (var c = 4; c <= 200; c++)
+        {
+            var name = ws.Cell(1, c).GetString().Trim();
+
+            if (name.Length == 0)
+            {
+                break;
+            }
+
+            headers.Add(name);
+        }
+
+        log.AppendLine($"Data columns: {string.Join(", ", headers)}");
+
+        // Row 2 is the recorded one; row 3 is the tester's addition.
+        ws.Cell(3, 1).Value = test.Id;
+        ws.Cell(3, 2).Value = "Admin and a bolt";
+        ws.Cell(3, 3).Value = true;
+
+        for (var c = 0; c < headers.Count; c++)
+        {
+            var column = headers[c];
+            var recorded = ws.Cell(2, 4 + c).GetString();
+
+            var replacement = column == expectedColumn
+                ? "Submitted: ali / Admin / pro / true / Bolt M8"
+                : recorded switch
+                {
+                    "saif" => "ali",
+                    "Manager" => "Admin",
+                    "widget" => "bolt",
+                    "Widget clamp" => "Bolt M8",
+                    _ => recorded
+                };
+
+            ws.Cell(3, 4 + c).Value = replacement;
+        }
+
+        book.Save();
+    }
+
+    /// <summary>A small page holding one of every control the recorder handles.</summary>
     private static string WriteSamplePage()
     {
         var file = Path.Combine(Path.GetTempPath(), "pts-selftest-form.html");

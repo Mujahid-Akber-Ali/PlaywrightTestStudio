@@ -139,6 +139,22 @@ internal static class Ui
         }
     }
 
+    /// <summary>Opens a file with whatever Windows uses for it.</summary>
+    public static void Open(string path)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Error(ex.Message);
+        }
+    }
+
     /// <summary>
     /// Runs async work behind a small modal so the operator sees progress and
     /// cannot start a second browser against the same profile.
