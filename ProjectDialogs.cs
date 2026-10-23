@@ -47,44 +47,92 @@ internal static class ProjectDialogs
 
         string? chosen = null;
 
-        var open = Ui.Primary("Open", 20, 308, 130);
-        var create = Ui.Secondary("New project...", 160, 308, 130);
-        var remove = Ui.Secondary("Delete", 300, 308, 90);
-        var quit = Ui.Secondary("Quit", 400, 308, 98);
+        var open = Ui.Primary("Open", 20, 308, 100);
+        var create = Ui.Secondary("New project...", 128, 308, 118);
+        var rename = Ui.Secondary("Rename...", 254, 308, 88);
+        var remove = Ui.Secondary("Delete", 350, 308, 74);
+        var quit = Ui.Secondary("Quit", 432, 308, 66);
+
+        // Asks for a new name and moves the project to it. Null when the
+        // operator backs out or the move fails.
+        string? Rename(string current, string heading, string hint)
+        {
+            var name = AskProjectName("Rename project", heading, hint,
+                LooksLikeLink(current) ? SuggestProjectName(current) : current, current);
+
+            if (name is null || name == current)
+            {
+                return null;
+            }
+
+            try
+            {
+                Storage.RenameProject(current, name);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Ui.Error($"Could not rename the project.\r\n\r\n{ex.Message}\r\n\r\n" +
+                         "Close any of its files that are open (Excel, a screenshot, a video) and try again.");
+                return null;
+            }
+
+            var at = list.Items.IndexOf(current);
+
+            if (at >= 0)
+            {
+                list.Items[at] = name;
+                list.SelectedIndex = at;
+            }
+
+            return name;
+        }
 
         open.Click += (_, _) =>
         {
-            if (list.SelectedItem is string name)
-            {
-                chosen = name;
-                form.DialogResult = DialogResult.OK;
-            }
-            else
+            if (list.SelectedItem is not string name)
             {
                 Ui.Warn("Select a project first, or create a new one.");
+                return;
             }
+
+            // A project saved under a link gets a proper name the first time
+            // it is opened; backing out opens it as it is.
+            if (LooksLikeLink(name))
+            {
+                name = Rename(name, "Give this project a name",
+                    "This project was saved under a link. Type a short name for it - the link itself " +
+                    "stays with its test cases.") ?? name;
+            }
+
+            chosen = name;
+            form.DialogResult = DialogResult.OK;
         };
 
         list.DoubleClick += (_, _) => open.PerformClick();
 
         create.Click += (_, _) =>
         {
-            var name = AskText("New project", "Name this project", "What are you testing? For example: Portal UAT");
+            var name = AskProjectName("New project", "What is this project called?",
+                "A short name for what you are testing, for example: Portal UAT. " +
+                "Not the link - you are asked for that when you record.");
 
-            if (string.IsNullOrWhiteSpace(name))
+            if (name is null)
             {
-                return;
-            }
-
-            if (Storage.ListProjects().Any(p => string.Equals(p, name, StringComparison.OrdinalIgnoreCase)))
-            {
-                Ui.Warn($"A project called \"{name}\" already exists.");
                 return;
             }
 
             Storage.OpenProject(name);
             chosen = name;
             form.DialogResult = DialogResult.OK;
+        };
+
+        rename.Click += (_, _) =>
+        {
+            if (list.SelectedItem is string name)
+            {
+                Rename(name, "Rename this project",
+                    "Its test cases, test data, results and generated C# all move to the new name.");
+            }
         };
 
         remove.Click += (_, _) =>
@@ -115,11 +163,73 @@ internal static class ProjectDialogs
         form.Controls.Add(list);
         form.Controls.Add(empty);
         empty.BringToFront();
-        form.Controls.AddRange(new Control[] { open, create, remove, quit });
+        form.Controls.AddRange(new Control[] { open, create, rename, remove, quit });
         form.AcceptButton = open;
         form.CancelButton = quit;
 
         return form.ShowDialog() == DialogResult.OK ? chosen : null;
+    }
+
+    /// <summary>
+    /// Asks for a project name and will not take a link for one - the name is
+    /// what the project, its folder and its files are saved under.
+    /// </summary>
+    private static string? AskProjectName(string title, string heading, string hint,
+        string initial = "", string? current = null)
+    {
+        return AskText(title, heading, hint, initial, name =>
+        {
+            if (LooksLikeLink(name))
+            {
+                return "That is a link, not a name.\r\n\r\n" +
+                       "Type a short name for the project, for example: Portal UAT.";
+            }
+
+            var same = current is not null && string.Equals(name, current, StringComparison.OrdinalIgnoreCase);
+
+            return !same && Storage.ProjectExists(name)
+                ? $"A project called \"{name}\" already exists."
+                : null;
+        });
+    }
+
+    /// <summary>True when the text is a web address rather than a name somebody chose.</summary>
+    public static bool LooksLikeLink(string text)
+    {
+        var t = text.Trim();
+
+        if (t.Contains("://") || t.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // What a link turns into once it has been through Storage.Slug.
+        if (t.StartsWith("https_", StringComparison.OrdinalIgnoreCase) ||
+            t.StartsWith("http_", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return !t.Contains(' ') && t.Contains('.') && t.Contains('/');
+    }
+
+    /// <summary>A starting point for naming a project that was saved under a link.</summary>
+    private static string SuggestProjectName(string link)
+    {
+        if (!Uri.TryCreate(link.Trim(), UriKind.Absolute, out var uri))
+        {
+            return "";
+        }
+
+        var parts = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var words = string.Join(' ', parts.TakeLast(2)).Replace('-', ' ').Replace('_', ' ').Trim();
+
+        if (words.Length == 0)
+        {
+            words = uri.Host;
+        }
+
+        return char.ToUpperInvariant(words[0]) + words[1..];
     }
 
     /// <summary>
@@ -228,7 +338,8 @@ internal static class ProjectDialogs
     }
 
     /// <summary>A one-line prompt, used for project and test case names.</summary>
-    public static string? AskText(string title, string heading, string hint, string initial = "")
+    public static string? AskText(string title, string heading, string hint, string initial = "",
+        Func<string, string?>? problemWith = null)
     {
         using var form = Ui.NewForm($"{Ui.AppTitle} - {title}", 460, 200);
 
@@ -251,6 +362,14 @@ internal static class ProjectDialogs
             if (input.Text.Trim().Length == 0)
             {
                 Ui.Warn("Type a name first.");
+                return;
+            }
+
+            if (problemWith?.Invoke(input.Text.Trim()) is { } problem)
+            {
+                Ui.Warn(problem);
+                input.SelectAll();
+                input.Focus();
                 return;
             }
 

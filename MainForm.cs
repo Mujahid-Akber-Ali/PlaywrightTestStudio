@@ -5,7 +5,7 @@ namespace PlaywrightTestStudio;
 
 /// <summary>
 /// The home screen for one project. Recording is the way in; everything else -
-/// the Excel round trip, running, results - hangs off it.
+/// the test data round trip, running, the results file - hangs off it.
 /// </summary>
 internal sealed class MainForm : Form
 {
@@ -22,7 +22,7 @@ internal sealed class MainForm : Form
 
         Text = $"{Ui.AppTitle} - {store.Name}";
         Font = Ui.Body;
-        ClientSize = new Size(760, 600);
+        ClientSize = new Size(760, 640);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false;
@@ -42,12 +42,15 @@ internal sealed class MainForm : Form
         showAll.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
         showAll.BackColor = Color.FromArgb(60, 60, 60);
 
-        var download = Ui.Secondary("Download Excel (test cases + data)", 20, 144, 350);
-        var upload = Ui.Secondary("Upload Excel and run", 380, 144, 350);
+        var download = Ui.Secondary("Download test data (Excel)", 20, 144, 350);
+        var upload = Ui.Secondary("Upload test data and run", 380, 144, 350);
 
-        var runAll = Ui.Secondary("Run all test cases", 20, 182, 230);
-        var scan = Ui.Secondary("Scan a page instead...", 258, 182, 230);
-        var signIn = Ui.Secondary("Sign in to a site...", 496, 182, 234);
+        var runAll = Ui.Secondary("Run all test cases", 20, 182, 226);
+        var results = Ui.Secondary("Results file (with charts)", 254, 182, 226);
+        var scan = Ui.Secondary("Scan a page instead...", 488, 182, 242);
+
+        var signIn = Ui.Secondary("Sign in to a site...", 20, 220, 350);
+        var perf = Ui.Secondary("Performance metrics (Excel)...", 380, 220, 350);
 
         var headless = new CheckBox
         {
@@ -55,25 +58,25 @@ internal sealed class MainForm : Form
             Font = Ui.Body,
             AutoSize = true,
             Checked = AppSettings.Headless,
-            Location = new Point(22, 226)
+            Location = new Point(22, 266)
         };
 
-        var recentLabel = Ui.Hint("Recent runs", 20, 256);
+        var recentLabel = Ui.Hint("Recent runs", 20, 296);
         recentLabel.Font = Ui.Bold;
         recentLabel.ForeColor = SystemColors.ControlText;
 
         _recent = new ListBox
         {
             Font = Ui.Mono,
-            Location = new Point(20, 278),
+            Location = new Point(20, 318),
             Size = new Size(710, 236),
             IntegralHeight = false
         };
 
-        var switchProject = Ui.Secondary("Switch project", 20, 528, 150);
-        var codeFolder = Ui.Secondary("Generated C#", 178, 528, 150);
-        var dataFolder = Ui.Secondary("Data folder", 336, 528, 130);
-        var quit = Ui.Secondary("Quit", 630, 528, 100);
+        var switchProject = Ui.Secondary("Switch project", 20, 568, 150);
+        var codeFolder = Ui.Secondary("Generated C#", 178, 568, 150);
+        var dataFolder = Ui.Secondary("Data folder", 336, 568, 130);
+        var quit = Ui.Secondary("Quit", 630, 568, 100);
 
         record.Click += async (_, _) =>
         {
@@ -84,9 +87,11 @@ internal sealed class MainForm : Form
         };
         showAll.Click += (_, _) => { TestCaseDialogs.ShowAll(this, _store); RefreshView(); };
         runAll.Click += (_, _) => { TestCaseDialogs.RunAll(this, _store); RefreshView(); };
+        results.Click += (_, _) => TestCaseDialogs.OpenResultsFile(_store);
         scan.Click += (_, _) => { ScanNewTestCase(); RefreshView(); };
         download.Click += (_, _) => DownloadExcel();
         upload.Click += (_, _) => { UploadExcel(); RefreshView(); };
+        perf.Click += (_, _) => DownloadPerformance();
         codeFolder.Click += (_, _) => Ui.Reveal(_store.CodeDir);
         dataFolder.Click += (_, _) => Ui.Reveal(_store.Dir);
 
@@ -131,7 +136,7 @@ internal sealed class MainForm : Form
 
         Controls.AddRange(new Control[]
         {
-            record, showAll, download, upload, runAll, scan, signIn, headless,
+            record, showAll, download, upload, runAll, results, scan, signIn, perf, headless,
             recentLabel, _recent, switchProject, codeFolder, dataFolder, quit
         });
 
@@ -170,8 +175,9 @@ internal sealed class MainForm : Form
         text.Length <= max ? text : text[..(max - 3)] + "...";
 
     /// <summary>
-    /// Writes the project's workbook wherever the operator wants it. This is the
-    /// template they hand to whoever is going to type the test data.
+    /// Writes the project's test data wherever the operator wants it: the
+    /// values entered while recording, one sheet per test case. This is the
+    /// file they hand to whoever is going to type more of it.
     /// </summary>
     private void DownloadExcel()
     {
@@ -179,13 +185,13 @@ internal sealed class MainForm : Form
 
         if (tests.Count == 0)
         {
-            Ui.Info("Record a test case first - there is nothing to put in the workbook yet.");
+            Ui.Info("Record a test case first - there is no test data to download yet.");
             return;
         }
 
         using var save = new SaveFileDialog
         {
-            Title = "Download test cases and test data",
+            Title = "Download test data",
             Filter = "Excel workbook (*.xlsx)|*.xlsx",
             FileName = _store.WorkbookName,
             InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
@@ -196,20 +202,28 @@ internal sealed class MainForm : Form
             return;
         }
 
+        int sheets;
+
         try
         {
-            ExcelBook.Export(_store, tests, save.FileName);
+            sheets = ExcelBook.Export(tests, save.FileName);
         }
         catch (IOException ex)
         {
-            Ui.Error($"Could not write the workbook.\r\n\r\n{ex.Message}\r\n\r\n" +
+            Ui.Error($"Could not write the file.\r\n\r\n{ex.Message}\r\n\r\n" +
                      "If it is open in Excel, close it and try again.");
             return;
         }
 
-        var rows = tests.Sum(t => t.DataSets.Count);
+        if (sheets == 0)
+        {
+            Ui.Info("None of the test cases enters any data - they only click - so there is no test data to download.");
+            return;
+        }
 
-        if (Ui.Confirm($"Saved {tests.Count} test case(s) and {rows} data row(s) to:\r\n{save.FileName}\r\n\r\n" +
+        var rows = tests.Where(t => t.Parameters().Count > 0).Sum(t => t.DataSets.Count);
+
+        if (Ui.Confirm($"Saved the test data of {sheets} test case(s), {rows} row(s) in all, to:\r\n{save.FileName}\r\n\r\n" +
                        "Open it now?"))
         {
             Ui.Open(save.FileName);
@@ -217,14 +231,73 @@ internal sealed class MainForm : Form
     }
 
     /// <summary>
-    /// Reads a filled-in workbook back and offers to run everything in it -
+    /// Opens a link, measures how it performed, and writes the numbers to an
+    /// Excel file: the load timeline, the paint and web-vital milestones, the
+    /// bytes that came down, and the slowest requests. Nothing is recorded or
+    /// saved to the project - it is a one-off reading of whatever page is asked
+    /// for, portal page or not.
+    /// </summary>
+    private void DownloadPerformance()
+    {
+        var url = ProjectDialogs.AskLink(this);
+
+        if (url is null)
+        {
+            return;
+        }
+
+        PerfReport report;
+
+        try
+        {
+            report = Ui.RunWithProgress(this, "Performance metrics", $"Opening {url}",
+                progress => Performance.MeasureAsync(url, AppSettings.Headless, progress));
+        }
+        catch (Exception ex)
+        {
+            Ui.Error(BrowserSession.Explain(ex), $"{Ui.AppTitle} - could not measure");
+            return;
+        }
+
+        using var save = new SaveFileDialog
+        {
+            Title = "Download performance metrics",
+            Filter = "Excel workbook (*.xlsx)|*.xlsx",
+            FileName = $"{Storage.Slug(report.Host)}-performance-{DateTime.Now:yyyyMMdd-HHmmss}.xlsx",
+            InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
+        };
+
+        if (save.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            PerfBook.Write(report, save.FileName);
+        }
+        catch (IOException ex)
+        {
+            Ui.Error($"Could not write the file.\r\n\r\n{ex.Message}\r\n\r\n" +
+                     "If it is open in Excel, close it and try again.");
+            return;
+        }
+
+        if (Ui.Confirm($"{report.Headline()}\r\n\r\nSaved to:\r\n{save.FileName}\r\n\r\nOpen it now?"))
+        {
+            Ui.Open(save.FileName);
+        }
+    }
+
+    /// <summary>
+    /// Reads a filled-in test data file back and offers to run everything -
     /// which is the whole point of handing the file out.
     /// </summary>
     private void UploadExcel()
     {
         using var open = new OpenFileDialog
         {
-            Title = "Upload test cases and test data",
+            Title = "Upload test data",
             Filter = "Excel workbook (*.xlsx)|*.xlsx",
             InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments)
         };
@@ -242,7 +315,8 @@ internal sealed class MainForm : Form
         }
         catch (Exception ex)
         {
-            Ui.Error($"Could not read that workbook.\r\n\r\n{ex.Message}");
+            Ui.Error($"Could not read that file.\r\n\r\n{ex.Message}\r\n\r\n" +
+                     "If it is open in Excel, close it and try again.");
             return;
         }
 
@@ -273,7 +347,8 @@ internal sealed class MainForm : Form
 
         if (Ui.Confirm(message + "\r\n\r\nRun everything now?"))
         {
-            TestCaseDialogs.RunAll(this, _store);
+            // Already asked, so the run does not ask again.
+            TestCaseDialogs.RunAll(this, _store, ask: false);
         }
     }
 
@@ -321,11 +396,9 @@ internal sealed class MainForm : Form
             return;
         }
 
-        var existingForLink = _store.LoadAll().Count(t => t.Url == url);
-
         var test = new TestCase
         {
-            Name = $"{CodeGen.ClassNameFor(url).Replace("Tests", "")} case {existingForLink + 1}",
+            Name = RecordDialogs.SuggestName(_store),
             Url = url,
             Source = "scanned",
             Elements = elements,
@@ -352,9 +425,8 @@ internal sealed class MainForm : Form
 
         if (choice.RunNow)
         {
-            var results = TestCaseDialogs.RunAndSave(this, _store, test);
+            TestCaseDialogs.RunAndShow(this, _store, test);
             RefreshView();
-            TestCaseDialogs.ShowResult(this, test, results);
             return;
         }
 

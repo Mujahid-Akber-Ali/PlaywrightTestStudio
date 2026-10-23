@@ -74,7 +74,7 @@ internal static class RecordDialogs
         var name = ProjectDialogs.AskText("Name", "Name this test case",
             $"{test.Steps.Count} action(s) were captured. " +
             "The name becomes the method in the generated C# file and the sheet name in Excel.",
-            SuggestName(store, url));
+            SuggestName(store));
 
         if (name is null)
         {
@@ -108,14 +108,13 @@ internal static class RecordDialogs
 
         if (choice.RunNow)
         {
-            var results = TestCaseDialogs.RunAndSave(owner, store, test);
-            TestCaseDialogs.ShowResult(owner, test, results);
+            TestCaseDialogs.RunAndShow(owner, store, test);
         }
         else
         {
             Ui.Info($"Saved \"{test.Name}\" with {test.Steps.Count} step(s).\r\n\r\n" +
                     $"C# file:\r\n{test.CodeFile}\r\n\r\n" +
-                    "Use \"Download Excel\" to add more test data rows.");
+                    "Use \"Download test data\" to add more test data rows.");
         }
 
         return test;
@@ -318,11 +317,17 @@ internal static class RecordDialogs
         }
     }
 
-    private static string SuggestName(ProjectStore store, string url)
+    /// <summary>A starting name built from the project, not from the link the case was recorded on.</summary>
+    public static string SuggestName(ProjectStore store)
     {
-        var existing = store.LoadAll().Count(t => t.Url == url);
-        var page = CodeGen.ClassNameFor(url).Replace("Tests", "");
+        var taken = store.LoadAll().Select(t => t.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var n = taken.Count + 1;
 
-        return $"{page} case {existing + 1}";
+        while (taken.Contains($"{store.Name} case {n}"))
+        {
+            n++;
+        }
+
+        return $"{store.Name} case {n}";
     }
 }

@@ -1,12 +1,14 @@
 using System.Text;
 using ClosedXML.Excel;
+using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Validation;
 
 namespace PlaywrightTestStudio;
 
 /// <summary>
 /// End-to-end check of the engine with no UI in the way. It walks the whole
-/// journey the tool is for: record a session, download the workbook, add a row
-/// of test data the way a tester would, upload it, and run every row.
+/// journey the tool is for: record a session, download the test data, add a row
+/// the way a tester would, upload it, run every row, and write the results file.
 ///
 /// Run with <c>PlaywrightTestStudio.exe --selftest</c>; the log lands in %TEMP%.
 /// </summary>
@@ -32,6 +34,7 @@ internal static class SelfTest
         var logFile = Path.Combine(Path.GetTempPath(), "playwright-test-studio-selftest.log");
         var store = Storage.OpenProject(ProjectName);
         var workbook = Path.Combine(Path.GetTempPath(), "pts-selftest-book.xlsx");
+        var resultsFile = Path.Combine(Path.GetTempPath(), "pts-selftest-results.xlsx");
 
         try
         {
@@ -75,10 +78,27 @@ internal static class SelfTest
                 test.Steps.Count(s => s.Selector == "#username") == 1,
                 $"{test.Steps.Count(s => s.Selector == "#username")} step(s) for #username");
 
+            // What must NOT be in the recording matters as much: each of these
+            // replays as a step with nothing to find.
+            Check("a change the page made to its own dropdown was not recorded",
+                test.Steps.Count(s => s.Selector == "#role") == 1,
+                $"{test.Steps.Count(s => s.Selector == "#role")} step(s) for #role");
+            Check("clicks on empty page were not recorded",
+                test.Steps.Count(s => s.Action == StepActions.Click) == 3,
+                string.Join(" | ", test.Steps.Where(s => s.Action == StepActions.Click).Select(s => s.Selector)));
+            Check("a bare label above a field names it",
+                test.Steps.Any(s => s.Selector == "#purposeBox" && s.Label == "Purpose"),
+                test.Steps.FirstOrDefault(s => s.Selector == "#purposeBox")?.Label ?? "(no step)");
+            Check("a plain box that turned out to be a lookup is replayed key by key",
+                test.Steps.Any(s => s.Selector == "#vendor" && s.Action == StepActions.Type),
+                test.Steps.FirstOrDefault(s => s.Selector == "#vendor")?.Action ?? "(no step)");
+            Check("the result picked from that lookup is a pick, named after its field",
+                test.Steps.Any(s => s.Pick && s.FallbackText == "Acme Tools" && s.Label == "Vendor result"));
+
             var parameters = test.Parameters();
             log.AppendLine($"Parameters  : {string.Join(", ", parameters)}");
 
-            Check("every typed value became a data column", parameters.Count == 4,
+            Check("every entered value became a data column", parameters.Count == 7,
                 string.Join(", ", parameters));
             Check("the picked result is named after its field, not its value",
                 parameters.Any(p => p.StartsWith("item", StringComparison.OrdinalIgnoreCase) && p.Contains("result", StringComparison.OrdinalIgnoreCase)),
@@ -87,7 +107,7 @@ internal static class SelfTest
                 !parameters.Any(p => p.Contains("submit", StringComparison.OrdinalIgnoreCase)),
                 string.Join(", ", parameters));
             Check("the recorded values became the first data row",
-                test.DataSets.Count == 1 && test.DataSets[0].Values.Count == 4);
+                test.DataSets.Count == 1 && test.DataSets[0].Values.Count == 7);
 
             // ---------------------------------------------------------------
             // 2. Assertions, including one that varies per data row.
@@ -105,6 +125,13 @@ internal static class SelfTest
             {
                 Kind = AssertionKinds.ElementVisible,
                 Selector = "#result"
+            });
+
+            test.Assertions.Add(new AssertionSpec
+            {
+                Kind = AssertionKinds.ElementValueEquals,
+                Selector = "#vendor",
+                Expected = "Acme Tools"
             });
 
             RecordDialogs.SyncRecordedRow(test);
@@ -129,23 +156,29 @@ internal static class SelfTest
             Check("the recorded session replays and passes", first.Count == 1 && first[0].IsPass, first[0].Message);
 
             // ---------------------------------------------------------------
-            // 4. Download the workbook.
+            // 4. Download the test data.
             // ---------------------------------------------------------------
-            ExcelBook.Export(store, new[] { test }, workbook);
+            var sheets = ExcelBook.Export(new[] { test }, workbook);
 
-            Check("the workbook was written", File.Exists(workbook));
+            Check("the test data file was written", File.Exists(workbook) && sheets == 1);
 
             using (var book = new XLWorkbook(workbook))
             {
                 var names = book.Worksheets.Select(w => w.Name).ToList();
                 log.AppendLine($"Sheets      : {string.Join(", ", names)}");
 
-                Check("the workbook explains itself", names.Contains("How to use"));
-                Check("it has a Test Cases sheet", names.Contains("Test Cases"));
-                Check("it has a Steps sheet", names.Contains("Steps"));
-                Check("it has an Assertions sheet", names.Contains("Assertions"));
-                Check("it has a Results sheet", names.Contains("Results"));
-                Check("it has a data sheet for the test case", names.Any(n => n.StartsWith("Data")));
+                var ws = book.Worksheets.First();
+                var headers = Enumerable.Range(1, 3 + parameters.Count).Select(c => ws.Cell(1, c).GetString()).ToList();
+
+                Check("the file holds test data and nothing else: one sheet per test case", names.Count == 1,
+                    string.Join(", ", names));
+                Check("its columns are the values entered while recording",
+                    headers.Skip(3).SequenceEqual(parameters), string.Join(", ", headers));
+                Check("its first row is what was recorded",
+                    ws.Cell(2, 2).GetString() == "Recorded" &&
+                    Enumerable.Range(0, parameters.Count).All(c =>
+                        ws.Cell(2, 4 + c).GetString() == test.DataSets[0].Values[parameters[c]]));
+                Check("the test id is kept out of sight", ws.Column(1).IsHidden);
             }
 
             // ---------------------------------------------------------------
@@ -169,6 +202,8 @@ internal static class SelfTest
                 string.Join("; ", report.Problems));
             Check("the upload read one test case back", report.TestCases == 1);
             Check("the upload added nothing unexpected", report.NewTestCases == 0);
+            Check("a row typed in without the hidden test id still found its test case", report.DataSets == 2,
+                $"{report.DataSets} row(s)");
 
             var reloaded = store.LoadAll().Single(t => t.Id == test.Id);
 
@@ -176,7 +211,7 @@ internal static class SelfTest
                 $"{reloaded.DataSets.Count} row(s)");
             Check("the steps survived the round trip", reloaded.Steps.Count == test.Steps.Count,
                 $"{reloaded.Steps.Count} vs {test.Steps.Count}");
-            Check("the assertions survived the round trip", reloaded.Assertions.Count == 2);
+            Check("the assertions survived the round trip", reloaded.Assertions.Count == 3);
             Check("the per-row expected value survived",
                 reloaded.Assertions.Any(a => a.Parameter == expectedColumn));
 
@@ -198,6 +233,8 @@ internal static class SelfTest
                 string.Join(" | ", both.Where(r => !r.IsPass).Select(r => $"{r.DataSet}: {r.Message}")));
             Check("each row was reported separately",
                 both.Select(r => r.DataSet).Distinct().Count() == 2);
+            Check("a row that picks a different item does not wait out a stale selector",
+                both.All(r => r.Seconds < 8), string.Join(", ", both.Select(r => $"{r.DataSet}: {r.Seconds}s")));
 
             store.Save(reloaded);
             TestCaseDialogs.RegenerateCode(store, reloaded);
@@ -214,8 +251,63 @@ internal static class SelfTest
             Check("one failing row fails the test case overall",
                 reloaded.LastResult?.Status == "Failed", reloaded.LastResult?.Status ?? "");
 
+            // A step that cannot be carried out has to say which one and why.
+            var broken = reloaded.Steps.First(s => s.Selector == "#username");
+            broken.Selector = "#no-such-field";
+
+            var missing = Runner.RunAllDataSetsAsync(reloaded, store, headless: true).GetAwaiter().GetResult();
+
+            log.AppendLine($"Broken step : {missing[0].Message}");
+
+            Check("a step that cannot find its field is an Error that names the step",
+                missing[0].Status == "Error" && missing[0].Message.StartsWith("Step 1 of") &&
+                missing[0].Message.Contains("#no-such-field"), missing[0].Message);
+
+            broken.Selector = "#username";
+
             // ---------------------------------------------------------------
-            // 8. The generated C# reflects all of it.
+            // 8. The results file, written at the end of a run.
+            // ---------------------------------------------------------------
+            Runner.RunAllDataSetsAsync(reloaded, store, headless: true).GetAwaiter().GetResult();
+            ResultsBook.Write(store, new[] { reloaded }, resultsFile);
+
+            using (var book = new XLWorkbook(resultsFile))
+            {
+                var names = book.Worksheets.Select(w => w.Name).ToList();
+
+                Check("the results file has a summary, the results and the checks",
+                    names.SequenceEqual(new[] { "Summary", "Results", "Checks" }), string.Join(", ", names));
+
+                var results = book.Worksheet("Results");
+
+                Check("it has a line per data row, with its outcome",
+                    results.Cell(2, 3).GetString() == "Passed" && results.Cell(3, 3).GetString() == "Failed",
+                    $"{results.Cell(2, 3).GetString()}, {results.Cell(3, 3).GetString()}");
+                Check("it lists every check that was made",
+                    book.Worksheet("Checks").LastRowUsed()!.RowNumber() == 1 + 2 * reloaded.Assertions.Count);
+            }
+
+            using (var document = SpreadsheetDocument.Open(resultsFile, false))
+            {
+                var charts = document.WorkbookPart!.WorksheetParts
+                    .Where(p => p.DrawingsPart is not null)
+                    .Sum(p => p.DrawingsPart!.ChartParts.Count());
+
+                var faults = new OpenXmlValidator().Validate(document).Take(10).ToList();
+
+                foreach (var fault in faults)
+                {
+                    log.AppendLine($"              invalid: {fault.Path?.XPath} - {fault.Description}");
+                }
+
+                Check("the results file has its charts", charts == 3, $"{charts} chart(s)");
+                Check("the results file is a valid workbook", faults.Count == 0, $"{faults.Count} fault(s)");
+            }
+
+            log.AppendLine($"Results file: {resultsFile}");
+
+            // ---------------------------------------------------------------
+            // 9. The generated C# reflects all of it.
             // ---------------------------------------------------------------
             reloaded.DataSets[1].Values[expectedColumn] = test.DataSets[0].Values[expectedColumn]
                 .Replace("saif", "ali").Replace("Manager", "Admin").Replace("Widget clamp", "Bolt M8");
@@ -236,17 +328,95 @@ internal static class SelfTest
                 code.Contains($"string {parameters[0]}"));
             Check("the generated test types into the lookup key by key",
                 code.Contains("PressSequentiallyAsync"));
-            Check("the generated test picks the result with a text fallback",
+            Check("the generated test picks the result by its wording",
+                code.Contains("PickAsync("));
+            Check("the generated test clicks a button with a text fallback",
                 code.Contains("ClickStepAsync("));
             Check("the generated fixture is valid NUnit shape",
                 code.Contains("[TestFixture]") && code.Contains(": PageTest"));
 
-            // Cleanup.
-            Storage.DeleteProject(ProjectName);
+            // ---------------------------------------------------------------
+            // 10. Performance metrics of a link, written to their own workbook.
+            // ---------------------------------------------------------------
+            var perfFile = Path.Combine(Path.GetTempPath(), "pts-selftest-performance.xlsx");
+            var perf = Performance.MeasureAsync(url, headless: true).GetAwaiter().GetResult();
 
-            if (Directory.Exists(store.CodeDir))
+            log.AppendLine($"Performance : {perf.Headline().Replace("\r\n", "  ")}");
+
+            Check("the measured report is for the page that was asked for", perf.Url == url);
+            Check("it has the full load timeline", perf.Timeline.Count == 8,
+                $"{perf.Timeline.Count} row(s)");
+            Check("it has the paint and web-vital milestones", perf.Experience.Count == 4,
+                $"{perf.Experience.Count} row(s)");
+            Check("the page reached its load event", perf.Timeline.Single(m => m.Label == "Page load").Value > 0,
+                $"{perf.Timeline.Single(m => m.Label == "Page load").Value} ms");
+
+            PerfBook.Write(perf, perfFile);
+
+            using (var book = new XLWorkbook(perfFile))
             {
-                Directory.Delete(store.CodeDir, recursive: true);
+                var names = book.Worksheets.Select(w => w.Name).ToList();
+
+                Check("the performance workbook has its overview and its requests",
+                    names.SequenceEqual(new[] { "Overview", "Requests" }), string.Join(", ", names));
+                Check("the overview names the page it measured",
+                    book.Worksheet("Overview").Cell(2, 1).GetString() == url);
+            }
+
+            using (var document = SpreadsheetDocument.Open(perfFile, false))
+            {
+                var faults = new OpenXmlValidator().Validate(document).Take(10).ToList();
+
+                foreach (var fault in faults)
+                {
+                    log.AppendLine($"              invalid: {fault.Path?.XPath} - {fault.Description}");
+                }
+
+                Check("the performance workbook is a valid workbook", faults.Count == 0, $"{faults.Count} fault(s)");
+            }
+
+            log.AppendLine($"Perf file   : {perfFile}");
+
+            File.Delete(perfFile);
+
+            // ---------------------------------------------------------------
+            // 11. A project is saved under its name, and can be given another.
+            // ---------------------------------------------------------------
+            Check("a link is not taken for a project name",
+                ProjectDialogs.LooksLikeLink("https://portal.example.com/uind/indents/new") &&
+                ProjectDialogs.LooksLikeLink("https_portal_example_com_uind_indents_new") &&
+                ProjectDialogs.LooksLikeLink("portal.example.com/indents") &&
+                !ProjectDialogs.LooksLikeLink("Portal UAT") &&
+                !ProjectDialogs.LooksLikeLink("Indents v2.1"));
+            Check("projects are listed by the name they were given",
+                Storage.ListProjects().Contains(ProjectName), string.Join(", ", Storage.ListProjects()));
+
+            const string renamedTo = "_selftest renamed";
+
+            if (Storage.ProjectExists(renamedTo))
+            {
+                Storage.DeleteProject(renamedTo);
+            }
+
+            var renamed = Storage.RenameProject(ProjectName, renamedTo);
+            var moved = renamed.LoadAll();
+
+            Check("a renamed project is listed under its new name only",
+                Storage.ListProjects().Contains(renamedTo) && !Storage.ListProjects().Contains(ProjectName),
+                string.Join(", ", Storage.ListProjects()));
+            Check("its test cases, screenshots and generated C# moved with it",
+                moved.Count == 1 &&
+                File.Exists(moved[0].CodeFile) && moved[0].CodeFile.StartsWith(renamed.CodeDir) &&
+                moved[0].LastResults.All(r => File.Exists(r.ScreenshotPath)) &&
+                !Directory.Exists(store.CodeDir),
+                moved.Count == 1 ? moved[0].CodeFile : $"{moved.Count} test case(s)");
+
+            // Cleanup. The results file is left behind on purpose, to be looked at.
+            Storage.DeleteProject(renamedTo);
+
+            if (Directory.Exists(renamed.CodeDir))
+            {
+                Directory.Delete(renamed.CodeDir, recursive: true);
             }
 
             File.Delete(pageFile);
@@ -277,9 +447,18 @@ internal static class SelfTest
         var page = session.Page;
 
         await page.FillAsync("#username", "saif");
-        await page.SelectOptionAsync("#role", new Microsoft.Playwright.SelectOptionValue { Label = "Manager" });
+
+        // Chosen from the keyboard, as a person would: Admin, then down to Manager.
+        await page.FocusAsync("#role");
+        await page.Keyboard.PressAsync("ArrowDown");
+
+        await page.FillAsync("#purposeBox", "Office supplies");
         await page.CheckAsync("input[name=\"plan\"][value=\"pro\"]");
         await page.CheckAsync("#terms");
+
+        // Clicks that land on the page rather than on anything in it.
+        await page.ClickAsync("h1");
+        await page.Mouse.ClickAsync(700, 150);
 
         var search = page.Locator("#itemSearch");
         await search.ClickAsync();
@@ -287,6 +466,15 @@ internal static class SelfTest
         await page.WaitForSelectorAsync("#itemResults li");
         await page.GetByText("Widget clamp").ClickAsync();
 
+        // A lookup with nothing to say it is one: a plain text box whose
+        // results are links the page adds as you type.
+        var vendor = page.Locator("#vendor");
+        await vendor.ClickAsync();
+        await vendor.PressSequentiallyAsync("acm", new Microsoft.Playwright.LocatorPressSequentiallyOptions { Delay = 40 });
+        await page.WaitForSelectorAsync("#vendorHits a");
+        await page.GetByText("Acme Tools").ClickAsync();
+
+        // Asks "Submit this form?" first; the answer has to be OK.
         await page.ClickAsync("#submit");
 
         // The page talks to the recorder through an exposed function, so give
@@ -320,7 +508,7 @@ internal static class SelfTest
     private static void AddDataRow(string path, TestCase test, string expectedColumn, StringBuilder log)
     {
         using var book = new XLWorkbook(path);
-        var ws = book.Worksheets.First(w => w.Name.StartsWith("Data"));
+        var ws = book.Worksheets.First();
 
         var headers = new List<string>();
 
@@ -338,8 +526,8 @@ internal static class SelfTest
 
         log.AppendLine($"Data columns: {string.Join(", ", headers)}");
 
-        // Row 2 is the recorded one; row 3 is the tester's addition.
-        ws.Cell(3, 1).Value = test.Id;
+        // Row 2 is the recorded one; row 3 is the tester's addition, typed in
+        // rather than copied, so the hidden test id column is left empty.
         ws.Cell(3, 2).Value = "Admin and a bolt";
         ws.Cell(3, 3).Value = true;
 
@@ -380,8 +568,8 @@ internal static class SelfTest
             <p><label for="username">User name</label>
                <input id="username" name="username" type="text" required></p>
 
-            <p><label for="notes">Notes</label>
-               <textarea id="notes" name="notes"></textarea></p>
+            <div><label>Purpose<span>*</span></label>
+               <textarea id="purposeBox" name="purpose"></textarea></div>
 
             <p><label for="role">Role</label>
                <select id="role" name="role">
@@ -397,6 +585,10 @@ internal static class SelfTest
                <input id="itemSearch" name="itemSearch" type="text" autocomplete="off"
                       role="combobox" aria-autocomplete="list" aria-owns="itemResults">
                <ul id="itemResults" role="listbox" style="display:none;list-style:none;margin:0;padding:0"></ul></p>
+
+            <div><label>Vendor</label>
+               <input id="vendor" name="vendor" type="text" autocomplete="off">
+               <div id="vendorHits"></div></div>
 
             <p><label for="terms">Accept terms</label>
                <input id="terms" name="terms" type="checkbox"></p>
@@ -439,7 +631,40 @@ internal static class SelfTest
               }, 400);
             });
 
+            // A lookup nothing marks as one, with its results added as links.
+            var vendors = ['Acme Tools', 'Acme Fasteners', 'Bright Steel'];
+            var vendorBox = document.getElementById('vendor');
+            var vendorHits = document.getElementById('vendorHits');
+            var vendorPending = null;
+
+            vendorBox.addEventListener('keyup', function () {
+              var term = vendorBox.value.trim().toLowerCase();
+              if (vendorPending) { clearTimeout(vendorPending); }
+              vendorHits.innerHTML = '';
+              if (term.length < 2) { return; }
+
+              vendorPending = setTimeout(function () {
+                vendors.filter(function (v) { return v.toLowerCase().indexOf(term) >= 0; }).forEach(function (hit) {
+                  var a = document.createElement('a');
+                  a.href = '#';
+                  a.textContent = hit;
+                  a.style.display = 'block';
+                  a.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    vendorBox.value = hit;
+                    vendorHits.innerHTML = '';
+                  });
+                  vendorHits.appendChild(a);
+                });
+              }, 300);
+            });
+
+            // Pages fire events at their own fields as they load. Nobody chose
+            // anything here, so it must not turn up in a recording.
+            document.getElementById('role').dispatchEvent(new Event('change', { bubbles: true }));
+
             document.getElementById('submit').addEventListener('click', function () {
+              if (!window.confirm('Submit this form?')) { return; }
               var plan = document.querySelector('input[name="plan"]:checked');
               var out = document.getElementById('result');
               out.style.display = 'block';

@@ -45,6 +45,10 @@ internal static class CodeGen
         sb.AppendLine($"public class {className} : PageTest");
         sb.AppendLine("{");
         sb.AppendLine($"    private const string Url = {Literal(url)};");
+        sb.AppendLine();
+        sb.AppendLine("    /// <summary>Answers OK to every \"Are you sure?\" box, as the studio does when it replays.</summary>");
+        sb.AppendLine("    [SetUp]");
+        sb.AppendLine("    public void AcceptDialogs() => Page.Dialog += (_, dialog) => _ = dialog.AcceptAsync();");
 
         var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -54,11 +58,21 @@ internal static class CodeGen
             AppendTestMethod(sb, test, usedNames);
         }
 
-        if (testsForLink.Any(t => t.Steps.Any(s => s.Use && s.Action == StepActions.Click &&
-                                                   s.FallbackText.Trim().Length > 0)))
+        var clicks = testsForLink
+            .SelectMany(t => t.Steps)
+            .Where(s => s.Use && s.Action == StepActions.Click && s.FallbackText.Trim().Length > 0)
+            .ToList();
+
+        if (clicks.Any(s => !s.Pick))
         {
             sb.AppendLine();
             AppendClickHelper(sb);
+        }
+
+        if (clicks.Any(s => s.Pick))
+        {
+            sb.AppendLine();
+            AppendPickHelper(sb);
         }
 
         sb.AppendLine("}");
@@ -130,10 +144,18 @@ internal static class CodeGen
 
             var locals = new HashSet<string>(StringComparer.Ordinal);
 
-            foreach (var step in steps)
+            for (var i = 0; i < steps.Count; i++)
             {
+                var step = steps[i];
+
+                // A pick waits for its own item, so the typing before it does
+                // not have to guess how long the search takes.
+                var pickFollows = i + 1 < steps.Count &&
+                                  steps[i + 1] is { Action: StepActions.Click, Pick: true } &&
+                                  steps[i + 1].FallbackText.Trim().Length > 0;
+
                 foreach (var line in StepStatements(step, ValueOf(step.Parameter, step.RecordedValue),
-                             UniqueLocal(locals, SearchVariable(step))))
+                             UniqueLocal(locals, SearchVariable(step)), pickFollows))
                 {
                     sb.AppendLine($"        {line}");
                 }
@@ -142,6 +164,7 @@ internal static class CodeGen
 
         sb.AppendLine();
         sb.AppendLine("        // Assertions");
+        sb.AppendLine("        await Page.WaitForLoadStateAsync(LoadState.Load);");
 
         if (test.Assertions.Count == 0)
         {
@@ -165,7 +188,8 @@ internal static class CodeGen
     /// Statements for one step. <paramref name="value"/> arrives already in C#
     /// form: a quoted literal, or the name of a method parameter.
     /// </summary>
-    private static IEnumerable<string> StepStatements(TestStep step, string value, string searchVar)
+    private static IEnumerable<string> StepStatements(TestStep step, string value, string searchVar,
+        bool pickFollows)
     {
         var note = step.Label.Trim().Length > 0 ? $"   // {Comment(step.Label)}" : "";
 
@@ -183,7 +207,12 @@ internal static class CodeGen
                 yield return $"await {searchVar}.FillAsync(\"\");";
                 yield return $"await {searchVar}.PressSequentiallyAsync({value}, " +
                              "new LocatorPressSequentiallyOptions { Delay = 60 });";
-                yield return "await Page.WaitForTimeoutAsync(600);";
+
+                if (!pickFollows)
+                {
+                    yield return "await Page.WaitForTimeoutAsync(500);";
+                }
+
                 break;
 
             case StepActions.Select:
@@ -200,7 +229,11 @@ internal static class CodeGen
                 break;
 
             case StepActions.Click:
-                if (step.FallbackText.Trim().Length > 0)
+                if (step.Pick && step.FallbackText.Trim().Length > 0)
+                {
+                    yield return $"await PickAsync({value}, {Literal(step.Selector)});{note}";
+                }
+                else if (step.FallbackText.Trim().Length > 0)
                 {
                     yield return $"await ClickStepAsync({Literal(step.Selector)}, {value});{note}";
                 }
@@ -211,7 +244,7 @@ internal static class CodeGen
 
                 if (step.WaitAfter)
                 {
-                    yield return "await Page.WaitForLoadStateAsync(LoadState.NetworkIdle);";
+                    yield return "await Page.WaitForLoadStateAsync(LoadState.DOMContentLoaded);";
                 }
 
                 break;
@@ -299,6 +332,42 @@ internal static class CodeGen
         sb.AppendLine("        }");
         sb.AppendLine();
         sb.AppendLine("        await Page.GetByText(fallbackText).First.ClickAsync(new LocatorClickOptions { Timeout = 10_000 });");
+        sb.AppendLine("    }");
+    }
+
+    /// <summary>
+    /// Picking from a list of results goes by the wording of the item, because
+    /// that is what the data row names. Where the recorded item sat in the list
+    /// is only the last resort.
+    /// </summary>
+    private static void AppendPickHelper(StringBuilder sb)
+    {
+        sb.AppendLine("    /// <summary>Picks an item from a list of results by its wording, once the list has it.</summary>");
+        sb.AppendLine("    private async Task PickAsync(string text, string selector)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        var shown = new LocatorFilterOptions { Visible = true };");
+        sb.AppendLine();
+        sb.AppendLine("        try");
+        sb.AppendLine("        {");
+        sb.AppendLine("            await Page.GetByText(text, new PageGetByTextOptions { Exact = true }).Filter(shown).First");
+        sb.AppendLine("                .ClickAsync(new LocatorClickOptions { Timeout = 10_000 });");
+        sb.AppendLine("            return;");
+        sb.AppendLine("        }");
+        sb.AppendLine("        catch (TimeoutException)");
+        sb.AppendLine("        {");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine("        try");
+        sb.AppendLine("        {");
+        sb.AppendLine("            await Page.GetByText(text).Filter(shown).First");
+        sb.AppendLine("                .ClickAsync(new LocatorClickOptions { Timeout = 5_000 });");
+        sb.AppendLine("            return;");
+        sb.AppendLine("        }");
+        sb.AppendLine("        catch (TimeoutException)");
+        sb.AppendLine("        {");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+        sb.AppendLine("        await Page.Locator(selector).First.ClickAsync(new LocatorClickOptions { Timeout = 5_000 });");
         sb.AppendLine("    }");
     }
 

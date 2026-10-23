@@ -299,6 +299,47 @@ internal static class TestCaseDialogs
         return results;
     }
 
+    /// <summary>Runs one test case, writes the results file, and shows how it went.</summary>
+    public static void RunAndShow(IWin32Window owner, ProjectStore store, TestCase test)
+    {
+        var results = RunAndSave(owner, store, test);
+
+        ShowResult(owner, test, results, WriteResultsFile(store));
+    }
+
+    /// <summary>
+    /// Writes the results file for the project as it stands: every test case,
+    /// with how each of its data rows last did. Returns the path, or null if
+    /// the file could not be written.
+    /// </summary>
+    public static string? WriteResultsFile(ProjectStore store)
+    {
+        try
+        {
+            return ResultsBook.Write(store, store.LoadAll());
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Ui.Error($"The run finished, but its results file could not be written.\r\n\r\n{ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Writes a fresh results file from the last run of every test case and opens it.</summary>
+    public static void OpenResultsFile(ProjectStore store)
+    {
+        if (store.LoadAll().All(t => t.LastResult is null))
+        {
+            Ui.Info("Nothing has been run in this project yet, so there are no results to show.");
+            return;
+        }
+
+        if (WriteResultsFile(store) is { } file)
+        {
+            Ui.Open(file);
+        }
+    }
+
     /// <summary>Rewrites the file that covers this test case's link.</summary>
     public static void RegenerateCode(ProjectStore store, TestCase test)
     {
@@ -317,7 +358,7 @@ internal static class TestCaseDialogs
     /// Runs every test case in the project, each against all its data rows.
     /// Sequential on purpose: they share one browser profile.
     /// </summary>
-    public static void RunAll(IWin32Window owner, ProjectStore store)
+    public static void RunAll(IWin32Window owner, ProjectStore store, bool ask = true)
     {
         var tests = store.LoadAll().Where(t => t.Enabled).ToList();
 
@@ -329,7 +370,7 @@ internal static class TestCaseDialogs
 
         var rows = tests.Sum(t => t.RunnableDataSets().Count);
 
-        if (!Ui.Confirm($"Run {tests.Count} test case(s) over {rows} data row(s) now?"))
+        if (ask && !Ui.Confirm($"Run {tests.Count} test case(s) over {rows} data row(s) now?"))
         {
             return;
         }
@@ -339,13 +380,17 @@ internal static class TestCaseDialogs
             {
                 var log = new List<(TestCase Test, TestResult Result)>();
 
+                // One window for the whole run: starting a browser per test
+                // case would cost more time than most test cases take.
+                await using var browser = new RunBrowser(AppSettings.Headless);
+
                 for (var i = 0; i < tests.Count; i++)
                 {
                     var test = tests[i];
                     var position = i + 1;
 
                     var results = await Runner.RunAllDataSetsAsync(test, store, AppSettings.Headless,
-                        line => report($"[{position}/{tests.Count}] {test.Name} - {line}"));
+                        line => report($"[{position}/{tests.Count}] {test.Name} - {line}"), browser);
 
                     store.Save(test);
 
@@ -365,16 +410,32 @@ internal static class TestCaseDialogs
         }
 
         var passed = all.Count(r => r.Result.IsPass);
+        var file = WriteResultsFile(store);
 
-        Ui.Info($"{passed} of {all.Count} run(s) passed.\r\n\r\n" +
-                string.Join("\r\n", all.Select(r =>
-                    $"{(r.Result.IsPass ? "PASS" : "FAIL")}  {r.Test.Name}" +
-                    (r.Result.DataSet.Length > 0 ? $"  [{r.Result.DataSet}]" : ""))),
-            $"{Ui.AppTitle} - run finished");
+        var lines = all.Select(r =>
+            $"{(r.Result.IsPass ? "PASS" : "FAIL")}  {r.Test.Name}" +
+            (r.Result.DataSet.Length > 0 ? $"  [{r.Result.DataSet}]" : "")).ToList();
+
+        var summary = $"{passed} of {all.Count} run(s) passed.\r\n\r\n" +
+                      string.Join("\r\n", lines.Take(20)) +
+                      (lines.Count > 20 ? $"\r\n... and {lines.Count - 20} more." : "");
+
+        if (file is null)
+        {
+            Ui.Info(summary, $"{Ui.AppTitle} - run finished");
+            return;
+        }
+
+        if (Ui.Confirm($"{summary}\r\n\r\nThe results file, with charts, is at:\r\n{file}\r\n\r\nOpen it now?",
+                $"{Ui.AppTitle} - run finished"))
+        {
+            Ui.Open(file);
+        }
     }
 
     /// <summary>The pass/fail popup shown straight after a run.</summary>
-    public static void ShowResult(IWin32Window owner, TestCase test, List<TestResult> results)
+    public static void ShowResult(IWin32Window owner, TestCase test, List<TestResult> results,
+        string? resultsFile = null)
     {
         var overall = results.Count > 0 && results.All(r => r.IsPass);
 
@@ -433,15 +494,19 @@ internal static class TestCaseDialogs
             }
         }
 
-        var shot = Ui.Secondary("Open screenshot", 20, 444, 130);
-        var code = Ui.Secondary("Open C# file", 148, 444, 120);
-        var video = Ui.Secondary("Open recording", 276, 444, 130);
+        var shot = Ui.Secondary("Open screenshot", 20, 444, 124);
+        var code = Ui.Secondary("Open C# file", 150, 444, 110);
+        var video = Ui.Secondary("Open recording", 266, 444, 124);
+        var file = Ui.Secondary("Open results file", 396, 444, 134);
         var close = Ui.Primary("Close", 686, 444, 110);
 
-        foreach (var control in new Control[] { shot, code, video })
+        foreach (var control in new Control[] { shot, code, video, file })
         {
             control.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
         }
+
+        file.Visible = resultsFile is not null;
+        file.Click += (_, _) => Ui.Open(resultsFile ?? "");
 
         close.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
         code.Enabled = test.CodeFile.Length > 0;
@@ -457,7 +522,7 @@ internal static class TestCaseDialogs
         video.Click += (_, _) => Ui.Reveal(test.VideoFile);
         close.Click += (_, _) => form.DialogResult = DialogResult.OK;
 
-        form.Controls.AddRange(new Control[] { grid, shot, code, video, close });
+        form.Controls.AddRange(new Control[] { grid, shot, code, video, file, close });
         form.AcceptButton = close;
         form.CancelButton = close;
 
@@ -545,16 +610,19 @@ internal static class TestCaseDialogs
 
         TestCase? Selected() => grid.CurrentRow?.Tag as TestCase;
 
-        var run = Ui.Primary("Run selected", 20, 544, 120);
-        var runAll = Ui.Primary("Run all", 148, 544, 90);
-        var details = Ui.Secondary("Last result", 246, 544, 100);
-        var steps = Ui.Secondary("Edit steps", 354, 544, 100);
-        var checks = Ui.Secondary("Edit checks", 462, 544, 100);
-        var openCode = Ui.Secondary("Open C# file", 570, 544, 110);
-        var delete = Ui.Secondary("Delete", 688, 544, 80);
+        var run = Ui.Primary("Run selected", 20, 544, 110);
+        var runAll = Ui.Primary("Run all", 136, 544, 80);
+        var details = Ui.Secondary("Last result", 222, 544, 92);
+        var resultsFile = Ui.Secondary("Results file", 320, 544, 92);
+        var steps = Ui.Secondary("Edit steps", 418, 544, 90);
+        var checks = Ui.Secondary("Edit checks", 514, 544, 94);
+        var openCode = Ui.Secondary("Open C# file", 614, 544, 104);
+        var delete = Ui.Secondary("Delete", 724, 544, 76);
         var close = Ui.Secondary("Close", 916, 544, 100);
 
-        foreach (var control in new Control[] { run, runAll, details, steps, checks, openCode, delete })
+        resultsFile.Click += (_, _) => OpenResultsFile(store);
+
+        foreach (var control in new Control[] { run, runAll, details, resultsFile, steps, checks, openCode, delete })
         {
             control.Anchor = AnchorStyles.Left | AnchorStyles.Bottom;
         }
@@ -570,7 +638,7 @@ internal static class TestCaseDialogs
 
             var results = RunAndSave(form, store, test);
             Reload();
-            ShowResult(form, test, results);
+            ShowResult(form, test, results, WriteResultsFile(store));
         };
 
         runAll.Click += (_, _) =>
@@ -643,7 +711,7 @@ internal static class TestCaseDialogs
             {
                 var results = RunAndSave(form, store, test);
                 Reload();
-                ShowResult(form, test, results);
+                ShowResult(form, test, results, WriteResultsFile(store));
             }
         };
 
@@ -689,7 +757,7 @@ internal static class TestCaseDialogs
         form.Controls.Add(summary);
         form.Controls.AddRange(new Control[]
         {
-            grid, run, runAll, details, steps, checks, openCode, delete, close
+            grid, run, runAll, details, resultsFile, steps, checks, openCode, delete, close
         });
 
         form.CancelButton = close;

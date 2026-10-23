@@ -58,9 +58,15 @@ internal sealed class BrowserSession : IAsyncDisposable
         context.SetDefaultNavigationTimeout(60_000);
 
         var page = context.Pages.Count > 0 ? context.Pages[0] : await context.NewPageAsync();
+        var session = new BrowserSession { Playwright = playwright, Context = context, Page = page };
 
-        return new BrowserSession { Playwright = playwright, Context = context, Page = page };
+        context.Close += (_, _) => session.Closed = true;
+
+        return session;
     }
+
+    /// <summary>True once the window is gone, whether we closed it or the operator did.</summary>
+    public bool Closed { get; private set; }
 
     /// <summary>
     /// Downloads the Chromium build Playwright expects, once per process. Cheap
@@ -109,6 +115,11 @@ internal sealed class BrowserSession : IAsyncDisposable
     {
         var text = ex.Message;
 
+        if (text.Contains("has been closed", StringComparison.OrdinalIgnoreCase))
+        {
+            return "The browser window was closed before the run finished.";
+        }
+
         if (text.Contains("ProcessSingleton", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("profile", StringComparison.OrdinalIgnoreCase) && text.Contains("use", StringComparison.OrdinalIgnoreCase))
         {
@@ -123,5 +134,61 @@ internal sealed class BrowserSession : IAsyncDisposable
         }
 
         return text;
+    }
+}
+
+/// <summary>
+/// The one browser a whole run shares. Starting Chromium costs a few seconds, so
+/// every test case and every data row gets a fresh tab in the same window
+/// instead of a window of its own.
+/// </summary>
+internal sealed class RunBrowser : IAsyncDisposable
+{
+    private readonly bool _headless;
+    private BrowserSession? _session;
+
+    public RunBrowser(bool headless)
+    {
+        _headless = headless;
+    }
+
+    /// <summary>
+    /// A clean tab for the next run. If the operator closed the window part way
+    /// through, a new one is started rather than failing everything after it.
+    /// </summary>
+    public async Task<IPage> NewPageAsync()
+    {
+        if (_session is null || _session.Closed)
+        {
+            await DisposeAsync();
+            _session = await BrowserSession.StartAsync(_headless);
+        }
+
+        var context = _session.Context;
+        var page = await context.NewPageAsync();
+
+        // Whatever the last run left open - its tab, any popups - goes, without
+        // running their "are you sure you want to leave" handlers.
+        foreach (var other in context.Pages.Where(p => p != page).ToList())
+        {
+            try
+            {
+                await other.CloseAsync();
+            }
+            catch (PlaywrightException)
+            {
+            }
+        }
+
+        return page;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_session is not null)
+        {
+            await _session.DisposeAsync();
+            _session = null;
+        }
     }
 }

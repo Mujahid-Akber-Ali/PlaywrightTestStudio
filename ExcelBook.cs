@@ -3,25 +3,32 @@ using ClosedXML.Excel;
 namespace PlaywrightTestStudio;
 
 /// <summary>
-/// The workbook a project is downloaded to and uploaded from. It is the format
-/// a tester works in: record once, download, copy the recorded row, type more
-/// test data underneath it, upload, and every row runs.
+/// The test data file a project is downloaded to and uploaded from. It is the
+/// format a tester works in: record once, download, copy the recorded row, type
+/// more test data underneath it, upload, and every row runs.
 ///
-/// Sheets:
-///   How to use   - instructions, so the file explains itself
-///   Test Cases   - one row per test case
-///   Steps        - the actions, in order, with the data column each one reads
-///   Assertions   - the checks that decide pass or fail
-///   Data - ...   - one sheet per test case, one row per data set
-///   Results      - what happened on the last run
+/// The file holds test data and nothing else: one sheet per test case, a column
+/// for every value that was entered while recording, and a row per data set.
+/// How the test drives the page - its steps, selectors and checks - stays in the
+/// project, where a stray edit in Excel cannot break it.
+///
+/// Results are not in here either; a run writes its own file (see
+/// <see cref="ResultsBook"/>).
 /// </summary>
 internal static class ExcelBook
 {
+    private const string IdHeader = "Test ID";
+    private const string NameHeader = "Data Set";
+    private const string EnabledHeader = "Enabled";
+
+    /// <summary>First column that holds a value the test enters.</summary>
+    private const int FirstDataColumn = 4;
+
+    // Sheets of the workbook this tool wrote before the data-only file. One of
+    // those can still be uploaded.
     private const string TestCasesSheet = "Test Cases";
     private const string StepsSheet = "Steps";
     private const string AssertionsSheet = "Assertions";
-    private const string ResultsSheet = "Results";
-    private const string DataSheetPrefix = "Data";
 
     private static readonly XLColor HeaderFill = XLColor.FromArgb(0, 90, 158);
 
@@ -35,204 +42,62 @@ internal static class ExcelBook
         public List<string> Problems { get; } = new();
 
         public string Summary =>
-            $"{TestCases} test case(s) read ({NewTestCases} new), " +
-            $"{Steps} step(s), {DataSets} data set(s), {Assertions} assertion(s).";
+            $"{DataSets} row(s) of test data read for {TestCases} test case(s)." +
+            (NewTestCases > 0 ? $" {NewTestCases} test case(s) were new." : "");
     }
 
     // -----------------------------------------------------------------------
     // Download
     // -----------------------------------------------------------------------
 
-    public static void Export(ProjectStore store, IReadOnlyList<TestCase> tests, string path)
+    /// <summary>
+    /// Writes the test data file and returns how many test cases went into it.
+    /// A test case that enters no data has nothing to put in a sheet and is left
+    /// out; when that is all of them, no file is written.
+    /// </summary>
+    public static int Export(IReadOnlyList<TestCase> tests, string path)
     {
         using var book = new XLWorkbook();
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        WriteInstructions(book, store);
-        WriteTestCases(book, tests);
-        WriteSteps(book, tests);
-        WriteAssertions(book, tests);
-
-        for (var i = 0; i < tests.Count; i++)
+        foreach (var test in tests.Where(t => t.Parameters().Count > 0))
         {
-            WriteData(book, tests[i], i + 1);
+            WriteData(book, test, names);
         }
 
-        WriteResults(book, tests);
-
-        book.SaveAs(path);
-    }
-
-    private static void WriteInstructions(XLWorkbook book, ProjectStore store)
-    {
-        var ws = book.Worksheets.Add("How to use");
-
-        var lines = new (string Heading, string Body)[]
+        if (book.Worksheets.Count > 0)
         {
-            ($"Project: {store.Name}", $"Downloaded {DateTime.Now:yyyy-MM-dd HH:mm}"),
-            ("", ""),
-            ("What this file is for",
-                "Each test case here was recorded in a browser. To run it against more data, " +
-                "you do not need to record again - just add rows of data to its Data sheet and upload this file."),
-            ("", ""),
-            ("1. Find the Data sheet for your test case",
-                "There is one 'Data - ...' sheet per test case. The first row is the data that was recorded."),
-            ("2. Add a row per case you want to run",
-                "Copy the recorded row, paste it underneath, give it a new name in the 'Data Set' column, " +
-                "and change the values. Every column after 'Enabled' is one value the test enters."),
-            ("3. Set Enabled",
-                "TRUE means the row runs. FALSE means it is skipped. Leave a row out entirely and it never runs."),
-            ("4. Upload this file",
-                "In the studio, use 'Upload Excel'. Every enabled row runs as its own test, and each one passes " +
-                "or fails on its own."),
-            ("", ""),
-            ("Expected values change too",
-                "On the Assertions sheet, put a data column name in the 'Parameter' column and the expected " +
-                "text will come from that column instead of being fixed. That is how row 1 can expect one result " +
-                "and row 2 another."),
-            ("", ""),
-            ("What not to change",
-                "Leave the 'Test ID' columns alone - they are how the studio matches this file back to its test " +
-                "cases. Changing a Target on the Steps sheet changes which element the test drives, so only do " +
-                "that if you know the page."),
-            ("", ""),
-            ("Results",
-                "The Results sheet shows the last run at the time of download. It is read only - uploading does " +
-                "not change any results.")
-        };
-
-        var row = 1;
-
-        foreach (var (heading, body) in lines)
-        {
-            if (heading.Length > 0)
-            {
-                ws.Cell(row, 1).Value = heading;
-                ws.Cell(row, 1).Style.Font.Bold = true;
-                ws.Cell(row, 2).Value = body;
-            }
-
-            row++;
+            book.SaveAs(path);
         }
 
-        ws.Column(1).Width = 36;
-        ws.Column(2).Width = 110;
-        ws.Column(2).Style.Alignment.WrapText = true;
-    }
-
-    private static void WriteTestCases(XLWorkbook book, IReadOnlyList<TestCase> tests)
-    {
-        var ws = book.Worksheets.Add(TestCasesSheet);
-
-        Header(ws, "Test ID", "Test Name", "Link", "Enabled", "Data Sets", "Steps", "Assertions", "Source", "Notes");
-
-        var row = 2;
-
-        foreach (var test in tests)
-        {
-            ws.Cell(row, 1).Value = test.Id;
-            ws.Cell(row, 2).Value = test.Name;
-            ws.Cell(row, 3).Value = test.Url;
-            ws.Cell(row, 4).Value = test.Enabled;
-            ws.Cell(row, 5).Value = test.DataSets.Count;
-            ws.Cell(row, 6).Value = test.Steps.Count;
-            ws.Cell(row, 7).Value = test.Assertions.Count;
-            ws.Cell(row, 8).Value = test.Source;
-            ws.Cell(row, 9).Value = test.Notes;
-            row++;
-        }
-
-        // Counts are a read-only summary; the real lists live on their own sheets.
-        ws.Columns(5, 8).Style.Font.FontColor = XLColor.Gray;
-        Finish(ws);
-    }
-
-    private static void WriteSteps(XLWorkbook book, IReadOnlyList<TestCase> tests)
-    {
-        var ws = book.Worksheets.Add(StepsSheet);
-
-        Header(ws, "Test ID", "Test Name", "Step", "Use", "Action", "Target", "Label",
-            "Recorded Value", "Parameter", "Fallback Text", "Wait After");
-
-        var row = 2;
-
-        foreach (var test in tests)
-        {
-            var n = 1;
-
-            foreach (var step in test.Steps)
-            {
-                ws.Cell(row, 1).Value = test.Id;
-                ws.Cell(row, 2).Value = test.Name;
-                ws.Cell(row, 3).Value = n++;
-                ws.Cell(row, 4).Value = step.Use;
-                ws.Cell(row, 5).Value = step.Action;
-                ws.Cell(row, 6).Value = step.Selector;
-                ws.Cell(row, 7).Value = step.Label;
-                ws.Cell(row, 8).Value = step.Value;
-                ws.Cell(row, 9).Value = step.Parameter;
-                ws.Cell(row, 10).Value = step.FallbackText;
-                ws.Cell(row, 11).Value = step.WaitAfter;
-
-                ws.Cell(row, 6).Style.Font.FontName = "Consolas";
-                row++;
-            }
-        }
-
-        Finish(ws);
-    }
-
-    private static void WriteAssertions(XLWorkbook book, IReadOnlyList<TestCase> tests)
-    {
-        var ws = book.Worksheets.Add(AssertionsSheet);
-
-        Header(ws, "Test ID", "Test Name", "#", "Check", "Selector", "Expected", "Parameter");
-
-        var row = 2;
-
-        foreach (var test in tests)
-        {
-            var n = 1;
-
-            foreach (var assertion in test.Assertions)
-            {
-                ws.Cell(row, 1).Value = test.Id;
-                ws.Cell(row, 2).Value = test.Name;
-                ws.Cell(row, 3).Value = n++;
-                ws.Cell(row, 4).Value = assertion.Kind;
-                ws.Cell(row, 5).Value = assertion.Selector;
-                ws.Cell(row, 6).Value = assertion.Expected;
-                ws.Cell(row, 7).Value = assertion.Parameter;
-
-                ws.Cell(row, 5).Style.Font.FontName = "Consolas";
-                row++;
-            }
-        }
-
-        // Spelling a check wrongly is the easiest way to break an upload, so the
-        // allowed wording is offered as a dropdown.
-        if (row > 2)
-        {
-            ws.Range(2, 4, Math.Max(row + 40, 60), 4)
-              .CreateDataValidation()
-              .List(string.Join(",", AssertionKinds.All), inCellDropdown: true);
-        }
-
-        Finish(ws);
+        return book.Worksheets.Count;
     }
 
     /// <summary>
     /// One sheet per test case: the recorded values on the first row, and room
     /// underneath for as many more rows as the tester wants.
     /// </summary>
-    private static void WriteData(XLWorkbook book, TestCase test, int index)
+    private static void WriteData(XLWorkbook book, TestCase test, HashSet<string> names)
     {
-        var ws = book.Worksheets.Add(DataSheetName(test, index));
+        var ws = book.Worksheets.Add(SheetName(test, names));
         var parameters = test.Parameters();
 
-        var headers = new List<string> { "Test ID", "Data Set", "Enabled" };
+        var headers = new List<string> { IdHeader, NameHeader, EnabledHeader };
         headers.AddRange(parameters);
 
-        Header(ws, headers.ToArray());
+        for (var c = 0; c < headers.Count; c++)
+        {
+            var cell = ws.Cell(1, c + 1);
+            cell.Value = headers[c];
+            cell.Style.Font.Bold = true;
+            cell.Style.Font.FontColor = XLColor.White;
+            cell.Style.Fill.BackgroundColor = HeaderFill;
+        }
+
+        // Whatever is typed under a data column is taken as written. Without
+        // this Excel turns 2026-10-01 into a date and 007 into 7.
+        ws.Range(2, FirstDataColumn, 1000, Math.Max(FirstDataColumn, headers.Count))
+          .Style.NumberFormat.Format = "@";
 
         var row = 2;
 
@@ -244,56 +109,23 @@ internal static class ExcelBook
 
             for (var c = 0; c < parameters.Count; c++)
             {
-                ws.Cell(row, 4 + c).Value = set.Values.TryGetValue(parameters[c], out var v) ? v : "";
+                ws.Cell(row, FirstDataColumn + c).Value = set.Values.TryGetValue(parameters[c], out var v) ? v : "";
             }
 
             row++;
         }
 
-        var note = ws.Cell(row + 1, 1);
-        note.Value = "Copy a row above, change the values, and give it a new Data Set name. Every enabled row runs.";
-        note.Style.Font.Italic = true;
-        note.Style.Font.FontColor = XLColor.Gray;
+        ws.Cell(1, 2).CreateComment().AddText(
+            $"Test case: {test.Name}\n\n" +
+            "Each row is one run. Copy a row, change its values and give it a new name here. " +
+            "Rows with Enabled = FALSE are skipped.");
 
-        ws.Column(1).Style.Font.FontColor = XLColor.Gray;
-        Finish(ws);
-    }
+        // The id ties the sheet back to its test case. It is there when a row
+        // is copied, and out of the way the rest of the time.
+        ws.Column(1).Hide();
 
-    private static void WriteResults(XLWorkbook book, IReadOnlyList<TestCase> tests)
-    {
-        var ws = book.Worksheets.Add(ResultsSheet);
-
-        Header(ws, "Test ID", "Test Name", "Data Set", "Status", "Message", "Ran At", "Seconds", "Screenshot");
-
-        var row = 2;
-
-        foreach (var test in tests)
-        {
-            var results = test.LastResults.Count > 0
-                ? test.LastResults
-                : test.LastResult is null ? new List<TestResult>() : new List<TestResult> { test.LastResult };
-
-            foreach (var result in results)
-            {
-                ws.Cell(row, 1).Value = test.Id;
-                ws.Cell(row, 2).Value = test.Name;
-                ws.Cell(row, 3).Value = result.DataSet;
-                ws.Cell(row, 4).Value = result.Status;
-                ws.Cell(row, 5).Value = result.Message;
-                ws.Cell(row, 6).Value = result.RanUtc == default ? "" : result.RanUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm");
-                ws.Cell(row, 7).Value = result.Seconds;
-                ws.Cell(row, 8).Value = result.ScreenshotPath;
-
-                ws.Cell(row, 4).Style.Font.Bold = true;
-                ws.Cell(row, 4).Style.Font.FontColor = result.IsPass
-                    ? XLColor.FromArgb(16, 124, 16)
-                    : XLColor.FromArgb(196, 43, 28);
-
-                row++;
-            }
-        }
-
-        Finish(ws);
+        ws.SheetView.FreezeRows(1);
+        ws.Columns().AdjustToContents(1, 200, 10, 60);
     }
 
     // -----------------------------------------------------------------------
@@ -301,9 +133,9 @@ internal static class ExcelBook
     // -----------------------------------------------------------------------
 
     /// <summary>
-    /// Reads a workbook back into the project. Test cases already in the project
-    /// are updated in place; unknown ids are added. Nothing is deleted - a test
-    /// case left out of the file is simply left alone.
+    /// Reads test data back into the project. The rows on a sheet replace the
+    /// rows its test case had. Nothing else about a test case changes, and a
+    /// test case with no sheet in the file is left alone.
     /// </summary>
     public static ImportReport Import(ProjectStore store, string path)
     {
@@ -312,17 +144,133 @@ internal static class ExcelBook
         using var book = new XLWorkbook(path);
 
         var existing = store.LoadAll().ToDictionary(t => t.Id, StringComparer.OrdinalIgnoreCase);
-        var steps = ReadSteps(book, report);
-        var assertions = ReadAssertions(book, report);
         var data = ReadData(book, report);
 
-        var cases = book.Worksheets.FirstOrDefault(w => w.Name == TestCasesSheet);
-
-        if (cases is null)
+        if (book.Worksheets.Any(w => w.Name == TestCasesSheet))
         {
-            report.Problems.Add($"No \"{TestCasesSheet}\" sheet - is this a workbook this tool wrote?");
+            ImportFullWorkbook(store, book, existing, data, report);
             return report;
         }
+
+        if (data.Count == 0)
+        {
+            report.Problems.Add("No test data was found in that file. Upload a file made with \"Download test data\".");
+            return report;
+        }
+
+        foreach (var (id, sets) in data)
+        {
+            if (!existing.TryGetValue(id, out var test))
+            {
+                report.Problems.Add(
+                    $"{sets.Count} row(s) belong to a test case that is not in this project (id {id}); they were skipped.");
+                report.DataSets -= sets.Count;
+                continue;
+            }
+
+            test.DataSets = sets;
+            store.Save(test);
+            report.TestCases++;
+        }
+
+        return report;
+    }
+
+    /// <summary>
+    /// Reads every test data sheet - any sheet whose first header is the test
+    /// id. Column headers after Enabled are the parameter names.
+    /// </summary>
+    private static Dictionary<string, List<DataSet>> ReadData(XLWorkbook book, ImportReport report)
+    {
+        var map = new Dictionary<string, List<DataSet>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var ws in book.Worksheets)
+        {
+            if (ws.Name is TestCasesSheet or StepsSheet or AssertionsSheet ||
+                !string.Equals(Text(ws.Cell(1, 1)), IdHeader, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var headers = new List<string>();
+
+            for (var c = FirstDataColumn; c <= 200; c++)
+            {
+                var name = Text(ws.Cell(1, c)).Trim();
+
+                if (name.Length == 0)
+                {
+                    break;
+                }
+
+                headers.Add(name);
+            }
+
+            // A row typed in from scratch has no id in the hidden column; it
+            // belongs to the test case the rest of the sheet belongs to.
+            var sheetId = Rows(ws).Select(r => Text(ws.Cell(r, 1))).FirstOrDefault(id => id.Length > 0) ?? "";
+
+            foreach (var row in Rows(ws))
+            {
+                var values = headers.Select((_, c) => Text(ws.Cell(row, FirstDataColumn + c))).ToList();
+                var name = Text(ws.Cell(row, 2)).Trim();
+
+                if (name.Length == 0 && values.All(v => v.Length == 0))
+                {
+                    continue;
+                }
+
+                var id = Text(ws.Cell(row, 1));
+
+                if (id.Length == 0)
+                {
+                    id = sheetId;
+                }
+
+                if (id.Length == 0)
+                {
+                    report.Problems.Add($"Sheet \"{ws.Name}\" has lost its test id, so its rows cannot be matched to a test case.");
+                    break;
+                }
+
+                var set = new DataSet
+                {
+                    Name = name.Length > 0 ? name : $"Row {row - 1}",
+                    Enabled = Flag(ws.Cell(row, 3), fallback: true)
+                };
+
+                for (var c = 0; c < headers.Count; c++)
+                {
+                    set.Values[headers[c]] = values[c];
+                }
+
+                if (!map.TryGetValue(id, out var list))
+                {
+                    map[id] = list = new List<DataSet>();
+                }
+
+                list.Add(set);
+                report.DataSets++;
+            }
+        }
+
+        return map;
+    }
+
+    // -----------------------------------------------------------------------
+    // The older workbook, which also carried the steps and the checks
+    // -----------------------------------------------------------------------
+
+    private static void ImportFullWorkbook(
+        ProjectStore store,
+        XLWorkbook book,
+        Dictionary<string, TestCase> existing,
+        Dictionary<string, List<DataSet>> data,
+        ImportReport report)
+    {
+        var steps = ReadSteps(book, report);
+        var assertions = ReadAssertions(book, report);
+        var cases = book.Worksheets.First(w => w.Name == TestCasesSheet);
 
         foreach (var row in Rows(cases))
         {
@@ -374,8 +322,6 @@ internal static class ExcelBook
             store.Save(test);
             report.TestCases++;
         }
-
-        return report;
     }
 
     private static Dictionary<string, List<TestStep>> ReadSteps(XLWorkbook book, ImportReport report)
@@ -470,9 +416,7 @@ internal static class ExcelBook
 
             if (match is null)
             {
-                report.Problems.Add(
-                    $"{AssertionsSheet} row {row}: \"{kind}\" is not a check the tool knows. " +
-                    "Pick one from the dropdown in that column.");
+                report.Problems.Add($"{AssertionsSheet} row {row}: \"{kind}\" is not a check the tool knows.");
                 continue;
             }
 
@@ -495,90 +439,9 @@ internal static class ExcelBook
         return map;
     }
 
-    /// <summary>
-    /// Reads every "Data - ..." sheet. Column headers after Enabled are the
-    /// parameter names, so a tester can add a column simply by naming it.
-    /// </summary>
-    private static Dictionary<string, List<DataSet>> ReadData(XLWorkbook book, ImportReport report)
-    {
-        var map = new Dictionary<string, List<DataSet>>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var ws in book.Worksheets.Where(w => w.Name.StartsWith(DataSheetPrefix, StringComparison.OrdinalIgnoreCase)))
-        {
-            if (!string.Equals(Text(ws.Cell(1, 1)), "Test ID", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            var headers = new List<string>();
-
-            for (var c = 4; c <= 200; c++)
-            {
-                var name = Text(ws.Cell(1, c)).Trim();
-
-                if (name.Length == 0)
-                {
-                    break;
-                }
-
-                headers.Add(name);
-            }
-
-            foreach (var row in Rows(ws))
-            {
-                var id = Text(ws.Cell(row, 1));
-                var name = Text(ws.Cell(row, 2)).Trim();
-
-                if (id.Length == 0 || name.Length == 0)
-                {
-                    continue;
-                }
-
-                var set = new DataSet
-                {
-                    Name = name,
-                    Enabled = Flag(ws.Cell(row, 3), fallback: true)
-                };
-
-                for (var c = 0; c < headers.Count; c++)
-                {
-                    set.Values[headers[c]] = Text(ws.Cell(row, 4 + c));
-                }
-
-                if (!map.TryGetValue(id, out var list))
-                {
-                    map[id] = list = new List<DataSet>();
-                }
-
-                list.Add(set);
-                report.DataSets++;
-            }
-        }
-
-        return map;
-    }
-
     // -----------------------------------------------------------------------
     // Sheet plumbing
     // -----------------------------------------------------------------------
-
-    private static void Header(IXLWorksheet ws, params string[] names)
-    {
-        for (var c = 0; c < names.Length; c++)
-        {
-            var cell = ws.Cell(1, c + 1);
-            cell.Value = names[c];
-            cell.Style.Font.Bold = true;
-            cell.Style.Font.FontColor = XLColor.White;
-            cell.Style.Fill.BackgroundColor = HeaderFill;
-        }
-    }
-
-    private static void Finish(IXLWorksheet ws)
-    {
-        ws.SheetView.FreezeRows(1);
-        ws.Columns().AdjustToContents(1, 200, 8, 60);
-    }
 
     /// <summary>Data rows of a sheet, skipping the header.</summary>
     private static IEnumerable<int> Rows(IXLWorksheet ws)
@@ -595,7 +458,23 @@ internal static class ExcelBook
     {
         try
         {
-            return cell.IsEmpty() ? "" : cell.Value.ToString()?.Trim() ?? "";
+            if (cell.IsEmpty())
+            {
+                return "";
+            }
+
+            // A date typed into Excel is a number underneath. The page wants
+            // it the way a date box holds it.
+            if (cell.DataType == XLDataType.DateTime)
+            {
+                var when = cell.GetDateTime();
+
+                return when.TimeOfDay == TimeSpan.Zero
+                    ? when.ToString("yyyy-MM-dd")
+                    : when.ToString("yyyy-MM-ddTHH:mm");
+            }
+
+            return cell.Value.ToString()?.Trim() ?? "";
         }
         catch (Exception)
         {
@@ -623,7 +502,7 @@ internal static class ExcelBook
     /// A sheet name Excel will accept: 31 characters, no : \ / ? * [ ] and
     /// unique within the book.
     /// </summary>
-    private static string DataSheetName(TestCase test, int index)
+    private static string SheetName(TestCase test, HashSet<string> used)
     {
         var clean = new string(test.Name
             .Where(ch => char.IsLetterOrDigit(ch) || ch is ' ' or '-' or '_')
@@ -632,12 +511,18 @@ internal static class ExcelBook
 
         if (clean.Length == 0)
         {
-            clean = "test";
+            clean = "Test data";
         }
 
-        var prefix = $"{DataSheetPrefix} {index} - ";
-        var room = 31 - prefix.Length;
+        var name = clean.Length <= 31 ? clean : clean[..31].Trim();
+        var n = 2;
 
-        return prefix + (clean.Length <= room ? clean : clean[..room]);
+        while (!used.Add(name))
+        {
+            var suffix = $" ({n++})";
+            name = (clean.Length <= 31 - suffix.Length ? clean : clean[..(31 - suffix.Length)].Trim()) + suffix;
+        }
+
+        return name;
     }
 }

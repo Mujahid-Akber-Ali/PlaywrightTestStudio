@@ -112,6 +112,22 @@ internal sealed class RecordingSession : IAsyncDisposable
             session._stopRequested.TrySetResult();
         };
 
+        // Left alone, Playwright cancels every "Are you sure?" box the instant
+        // it opens, and the operator never gets to answer it. With a handler
+        // attached the box stays up for them to click. Nobody is there to click
+        // when the window is hidden, so then it is accepted.
+        void LeaveDialogsToTheOperator(IPage opened) =>
+            opened.Dialog += (_, dialog) =>
+            {
+                if (headless)
+                {
+                    _ = dialog.AcceptAsync();
+                }
+            };
+
+        LeaveDialogsToTheOperator(page);
+        context.Page += (_, opened) => LeaveDialogsToTheOperator(opened);
+
         await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
 
         return session;
@@ -149,39 +165,71 @@ internal sealed class RecordingSession : IAsyncDisposable
                 }
                 else
                 {
+                    if (!StepActions.All.Contains(kind))
+                    {
+                        return;
+                    }
+
                     var step = new TestStep
                     {
                         Action = kind,
                         Selector = Str(item, "selector"),
                         Label = Str(item, "label"),
                         Value = Str(item, "value"),
-                        FallbackText = Str(item, "text"),
-                        WaitAfter = kind == StepActions.Click
+                        FallbackText = Str(item, "text")
                     };
 
                     var last = _steps.Count > 0 ? _steps[^1] : null;
 
                     if (kind == StepActions.Click)
                     {
+                        // The page flags a click on something a search produced:
+                        // it sits in a results list, or it appeared after the
+                        // last keystroke.
+                        var flagged = Flag(item, "pick");
+                        var typedJustBefore = last is not null &&
+                                              last.Action is StepActions.Type or StepActions.Fill;
+
                         // A click straight after typing into a lookup is picking
                         // a result, not pressing a button - and it belongs to the
                         // field that was typed into.
-                        var followsSearch = last is not null && last.Action == StepActions.Type;
+                        var followsSearch = typedJustBefore &&
+                                            (flagged || (last!.Action == StepActions.Type && !Flag(item, "button")));
 
-                        step.Pick = followsSearch ||
-                                    (item.TryGetProperty("pick", out var flag) && flag.ValueKind == JsonValueKind.True);
+                        step.Pick = flagged || followsSearch;
 
-                        if (followsSearch && last!.Label.Length > 0)
+                        if (followsSearch)
                         {
-                            step.Label = $"{last.Label} result";
+                            // A box whose typing produced a list to pick from is
+                            // a lookup, whatever it looked like, and has to be
+                            // replayed key by key for the list to show up again.
+                            last!.Action = StepActions.Type;
+
+                            if (last.Label.Length > 0)
+                            {
+                                step.Label = $"{last.Label} result";
+                            }
                         }
+
+                        // Picking from a list never loads a page; a button might.
+                        step.WaitAfter = !step.Pick;
+                    }
+
+                    if (kind == StepActions.Press && step.Value == "Enter")
+                    {
+                        // Enter in a box usually submits something.
+                        step.WaitAfter = true;
                     }
 
                     // Keystroke after keystroke in one box is one step, not ten.
+                    // A box already found to be a lookup stays one.
+                    var typing = step.Action is StepActions.Fill or StepActions.Type;
+
                     if (last is not null &&
                         last.Selector == step.Selector &&
-                        last.Action == step.Action &&
-                        step.Action is StepActions.Fill or StepActions.Type or StepActions.Select)
+                        (last.Action == step.Action
+                            ? typing || step.Action == StepActions.Select
+                            : typing && last.Action is StepActions.Fill or StepActions.Type))
                     {
                         last.Value = step.Value;
                     }
@@ -202,6 +250,9 @@ internal sealed class RecordingSession : IAsyncDisposable
         item.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
             ? v.GetString() ?? ""
             : "";
+
+    private static bool Flag(JsonElement item, string name) =>
+        item.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
 
     /// <summary>
     /// Closes the browser and returns the finished test case. Parameter names
@@ -261,7 +312,9 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         foreach (var step in test.Steps)
         {
-            if (!step.TakesValue || step.Action == StepActions.Goto)
+            // A column is for data somebody entered. Which key was pressed and
+            // where the page went are part of the script, not of the data.
+            if (!step.TakesValue || step.Action is StepActions.Goto or StepActions.Press)
             {
                 continue;
             }
@@ -327,8 +380,12 @@ internal sealed class RecordingSession : IAsyncDisposable
 
     /// <summary>
     /// Injected into every page. Listens in the capture phase so it sees the
-    /// action before the page's own handlers can stop it, and never changes what
-    /// the page does.
+    /// action before the page's own handlers can stop it, and - Alt+click
+    /// aside - never changes what the page does.
+    ///
+    /// What it leaves out matters as much as what it takes: a click on empty
+    /// page, a change the page made to itself, the inner workings of a select2
+    /// box. Each of those replays as a step that has nothing to find.
     ///
     /// Alt+click records an assertion on the element instead of a click.
     /// </summary>
@@ -337,40 +394,73 @@ internal sealed class RecordingSession : IAsyncDisposable
       if (window.__ptsRecorderInstalled) return;
       window.__ptsRecorderInstalled = true;
 
+      const send = (item) => {
+        try { window.__ptsRecord(JSON.stringify(item)); } catch (e) {}
+      };
+
+      // Esc ends the recording wherever the keyboard happens to be. Nothing
+      // else is taken from inside an iframe: a step recorded there could not be
+      // found again from the page that holds the frame.
+      if (window !== window.top) {
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') send({ kind: 'stop' });
+        }, true);
+        return;
+      }
+
       const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/([^\w-])/g, '\\$1');
+      const quote = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, 120);
 
       const unique = (sel) => {
         try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; }
       };
 
+      // An id a framework made up will be a different one on the next visit.
+      const stableId = (id) =>
+        typeof id === 'string' && id.length > 0 &&
+        !/\d{4,}|^(select2-|ember\d|ext-gen|yui_|gwt-|mat-|mui-|radix-|headlessui-|react-select|:r)/i.test(id) &&
+        !/(?=[0-9a-f-]*\d)[0-9a-f-]{12,}/i.test(id);
+
       const selectorFor = (el) => {
         if (!el || el.nodeType !== 1) return '';
-        if (el.id && unique('#' + esc(el.id))) return '#' + esc(el.id);
-
-        for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-automation-id']) {
-          const v = el.getAttribute(attr);
-          if (v) {
-            const s = '[' + attr + '="' + v.replace(/"/g, '\\"') + '"]';
-            if (unique(s)) return s;
-          }
-        }
+        if (stableId(el.id) && unique('#' + esc(el.id))) return '#' + esc(el.id);
 
         const tag = el.tagName.toLowerCase();
 
-        if (el.name) {
-          const n = String(el.name).replace(/"/g, '\\"');
+        const byAttr = (attr) => {
+          const v = el.getAttribute(attr);
+          if (!v || v.length > 150) return '';
+          const s = tag + '[' + attr + '="' + quote(v) + '"]';
+          return unique(s) ? s : '';
+        };
+
+        for (const attr of ['data-testid', 'data-test', 'data-qa', 'data-automation-id']) {
+          const s = byAttr(attr);
+          if (s) return s;
+        }
+
+        const name = el.getAttribute('name');
+        if (name) {
           if (el.type === 'radio' && el.value) {
-            const r = tag + '[name="' + n + '"][value="' + String(el.value).replace(/"/g, '\\"') + '"]';
+            const r = tag + '[name="' + quote(name) + '"][value="' + quote(el.value) + '"]';
             if (unique(r)) return r;
           }
-          const s = tag + '[name="' + n + '"]';
-          if (unique(s)) return s;
+          const s = byAttr('name');
+          if (s) return s;
+        }
+
+        // Wording and destinations outlive the layout around them.
+        for (const attr of (tag === 'a' ? ['aria-label', 'title', 'href'] : ['aria-label', 'placeholder', 'title'])) {
+          if (attr === 'href' && /^(#|javascript:)/i.test(el.getAttribute('href') || '#')) continue;
+          const s = byAttr(attr);
+          if (s) return s;
         }
 
         const parts = [];
         let node = el;
         while (node && node.nodeType === 1 && parts.length < 10) {
-          if (node.id && unique('#' + esc(node.id))) { parts.unshift('#' + esc(node.id)); break; }
+          if (stableId(node.id) && unique('#' + esc(node.id))) { parts.unshift('#' + esc(node.id)); break; }
           let part = node.tagName.toLowerCase();
           const parent = node.parentElement;
           if (parent) {
@@ -383,28 +473,71 @@ internal sealed class RecordingSession : IAsyncDisposable
         return parts.join(' > ');
       };
 
-      const clean = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim().slice(0, 120);
+      // ---- what a field is called ---------------------------------------
+      const CONTROLS = 'input:not([type="hidden"]), select, textarea';
+
+      // The label's own words, without the hint or the asterisk tucked inside.
+      const labelText = (node) => {
+        let own = '';
+        node.childNodes.forEach(c => { if (c.nodeType === 3) own += c.textContent; });
+        return (clean(own) || clean(node.innerText)).replace(/\s*[*:]+\s*$/, '').trim();
+      };
+
+      // Forms that put a bare <label> above the field without tying the two
+      // together: the nearest label before the field, as long as no other field
+      // sits in between to claim it.
+      const nearbyLabel = (el) => {
+        let node = el;
+        for (let depth = 0; depth < 3 && node && node.parentElement && node !== document.body; depth++) {
+          let sib = node.previousElementSibling;
+          while (sib) {
+            if (sib.matches('label, legend')) {
+              const text = labelText(sib);
+              if (text) return text;
+            }
+            if (sib.matches(CONTROLS) || sib.querySelector(CONTROLS)) return '';
+            sib = sib.previousElementSibling;
+          }
+          node = node.parentElement;
+        }
+        return '';
+      };
 
       const labelFor = (el) => {
-        if (el.id) {
-          const l = document.querySelector('label[for="' + esc(el.id) + '"]');
-          if (l && clean(l.innerText)) return clean(l.innerText);
-        }
-        const wrap = el.closest ? el.closest('label') : null;
-        if (wrap && clean(wrap.innerText)) return clean(wrap.innerText);
+        if (el.labels && el.labels.length && labelText(el.labels[0])) return labelText(el.labels[0]);
+
+        const ids = String(el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+        const named = ids.map(id => document.getElementById(id)).filter(Boolean).map(n => clean(n.innerText)).join(' ');
+        if (clean(named)) return clean(named);
 
         const aria = el.getAttribute('aria-label');
         if (clean(aria)) return clean(aria);
+
+        const t = String(el.type || '').toLowerCase();
+        if ((t === 'checkbox' || t === 'radio') && el.nextElementSibling &&
+            el.nextElementSibling.matches('label') && labelText(el.nextElementSibling)) {
+          return labelText(el.nextElementSibling);
+        }
+
+        const near = nearbyLabel(el);
+        if (near) return near;
 
         if (clean(el.placeholder)) return clean(el.placeholder);
         if (clean(el.title)) return clean(el.title);
 
         const cell = el.closest ? el.closest('td, th') : null;
-        if (cell && cell.previousElementSibling && clean(cell.previousElementSibling.innerText)) {
-          return clean(cell.previousElementSibling.innerText);
+        if (cell) {
+          if (cell.previousElementSibling && !cell.previousElementSibling.querySelector(CONTROLS) &&
+              clean(cell.previousElementSibling.innerText)) {
+            return clean(cell.previousElementSibling.innerText).replace(/\s*[*:]+\s*$/, '');
+          }
+          const table = cell.closest('table');
+          const head = table ? table.querySelector('thead tr, tr') : null;
+          const th = head ? head.children[cell.cellIndex] : null;
+          if (th && th !== cell && clean(th.innerText)) return clean(th.innerText);
         }
 
-        return clean(el.name || el.id || el.tagName.toLowerCase());
+        return clean(el.getAttribute('name') || el.id || el.tagName.toLowerCase());
       };
 
       // Fields that search as you type need their keys replayed one at a time.
@@ -422,19 +555,112 @@ internal sealed class RecordingSession : IAsyncDisposable
         return /search|lookup|find|suggest|autocomplete|typeahead/i.test(String(el.name || '') + ' ' + String(el.id || ''));
       };
 
-      const send = (item) => {
-        try { window.__ptsRecord(JSON.stringify(item)); } catch (e) {}
+      // ---- who did it: the operator, or the page to itself ---------------
+      // Pages fire events at their own fields while they load and whenever one
+      // field resets another. Those are not something the operator did, and
+      // replaying them asks for values that were never chosen.
+      let lastGesture = 0;
+      let lastTyped = 0;
+      let lastTypedIn = null;
+
+      for (const type of ['mousedown', 'pointerdown', 'keydown', 'touchstart']) {
+        document.addEventListener(type, (e) => {
+          if (!e.isTrusted) return;
+          lastGesture = Date.now();
+          hookJQuery();
+        }, true);
+      }
+
+      const justActed = () => Date.now() - lastGesture < 1500;
+
+      // What has been added to the page since the last keystroke. A click on
+      // one of those is a click on something the typing produced: a result.
+      // Only kept between a keystroke and the next click - everything on a
+      // page was "added" at some point while it loaded.
+      let fresh = null;
+
+      new MutationObserver((records) => {
+        if (!fresh) return;
+        for (const record of records) {
+          record.addedNodes.forEach(n => { if (n.nodeType === 1) fresh.add(n); });
+        }
+      }).observe(document, { childList: true, subtree: true });
+
+      const isFresh = (el) => {
+        if (!fresh) return false;
+        let node = el;
+        for (let depth = 0; depth < 6 && node && node.nodeType === 1; depth++) {
+          if (fresh.has(node)) return true;
+          node = node.parentElement;
+        }
+        return false;
+      };
+
+      // ---- select2 --------------------------------------------------------
+      // It hides the real <select>, draws its own box and list, and announces
+      // the choice through jQuery, where no ordinary listener hears it. The
+      // clicks inside it are its own business; the step worth keeping is
+      // "choose X in this dropdown", against the real <select>.
+      const inSelect2 = (el) => !!(el.closest && el.closest('.select2-container'));
+
+      // Sent there and then, not once select2 has applied the choice: steps
+      // have to arrive in the order they were taken.
+      const select2Chosen = (optionText) => {
+        const box = document.querySelector('select + .select2-container--open');
+        const select = box ? box.previousElementSibling : null;
+        if (!select || select.tagName !== 'SELECT' || !optionText) return;
+
+        send({ kind: 'select', selector: selectorFor(select), label: labelFor(select), value: optionText });
+      };
+
+      document.addEventListener('mousedown', (e) => {
+        if (!e.isTrusted || e.button !== 0 || !e.target || !e.target.closest) return;
+        const option = e.target.closest('.select2-results__option');
+        if (option && option.getAttribute('aria-disabled') !== 'true' && option.getAttribute('role') !== 'group') {
+          select2Chosen(clean(option.innerText));
+        }
+      }, true);
+
+      // Other dress-up dropdowns (chosen, bootstrap-select) announce the same
+      // way. jQuery may load long after this script, so look for it lazily.
+      let jqueryHooked = false;
+
+      const hookJQuery = () => {
+        if (jqueryHooked || !window.jQuery || !window.jQuery.fn || !window.jQuery.fn.on) return;
+        jqueryHooked = true;
+
+        window.jQuery(document).on('change', 'select', (e) => {
+          const el = e.target;
+          if (e.originalEvent || !justActed()) return;          // native ones are heard below
+          if (el.classList.contains('select2-hidden-accessible')) return;
+          const picked = el.selectedOptions && el.selectedOptions[0];
+          const value = picked ? clean(picked.text) : '';
+          if (!value || !el.value) return;
+          send({ kind: 'select', selector: selectorFor(el), label: labelFor(el), value: value });
+        });
       };
 
       // ---- typing -------------------------------------------------------
       document.addEventListener('input', (e) => {
         const el = e.target;
-        if (!el || !el.tagName) return;
+        if (!el || !el.tagName || inSelect2(el)) return;
+
+        // A calendar writing the chosen date into its box is worth a step. A
+        // lookup writing the picked item back into the box that was just typed
+        // in is not: the pick already says it.
+        if (!e.isTrusted && (!justActed() || el === lastTypedIn)) return;
+
         const tag = el.tagName.toLowerCase();
         if (tag !== 'input' && tag !== 'textarea' && !el.isContentEditable) return;
 
         const t = String(el.type || 'text').toLowerCase();
-        if (t === 'checkbox' || t === 'radio' || t === 'hidden') return;
+        if (t === 'checkbox' || t === 'radio' || t === 'hidden' || t === 'file') return;
+
+        if (e.isTrusted) {
+          fresh = new WeakSet();
+          lastTyped = Date.now();
+          lastTypedIn = el;
+        }
 
         send({
           kind: isTypeahead(el) ? 'type' : 'fill',
@@ -452,16 +678,19 @@ internal sealed class RecordingSession : IAsyncDisposable
 
         if (tag === 'select') {
           const picked = el.selectedOptions && el.selectedOptions[0];
-          send({
-            kind: 'select',
-            selector: selectorFor(el),
-            label: labelFor(el),
-            value: picked ? clean(picked.text) : String(el.value)
-          });
+          const value = picked ? clean(picked.text) : String(el.value);
+
+          // A dropdown the page changed by itself is only worth a step when it
+          // answers something the operator just did and actually chose
+          // something. Putting a dependent dropdown back to "Please select"
+          // is the page tidying up, not a choice.
+          if (!e.isTrusted && (!justActed() || !value || !el.value)) return;
+
+          send({ kind: 'select', selector: selectorFor(el), label: labelFor(el), value: value });
           return;
         }
 
-        if (tag === 'input') {
+        if (tag === 'input' && e.isTrusted) {
           const t = String(el.type || '').toLowerCase();
           if (t === 'checkbox') {
             send({ kind: el.checked ? 'check' : 'uncheck', selector: selectorFor(el), label: labelFor(el) });
@@ -472,37 +701,79 @@ internal sealed class RecordingSession : IAsyncDisposable
       }, true);
 
       // ---- clicks -------------------------------------------------------
+      const CLICKABLE =
+        'a, button, summary, label, [role="button"], [role="link"], [role="option"], [role="menuitem"], ' +
+        '[role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="treeitem"], [onclick], ' +
+        'input[type="submit"], input[type="button"], input[type="reset"], input[type="image"]';
+
+      const RESULTS =
+        '[role="listbox"], [role="option"], .tt-menu, ul.ui-autocomplete, .autocomplete-items, ' +
+        '.autocomplete-suggestions, .typeahead';
+
+      // A click that landed on the page rather than on anything in it - to
+      // close a list, to take the cursor out of a box. Replayed, it would hit
+      // whatever happens to sit in the middle of that area.
+      const stray = (el) =>
+        el === document.body || el === document.documentElement ||
+        el.matches('form, main, section, article, header, footer, nav, fieldset, table, tbody, tr, p, h1, h2, h3, h4, h5, h6') ||
+        !!el.querySelector('input, select, textarea, button, a') ||
+        (clean(el.innerText).length === 0 && !el.matches('img, svg, svg *, canvas, i')) ||
+        String(el.innerText || '').trim().length > 80;
+
       document.addEventListener('click', (e) => {
         const el = e.target;
-        if (!el || !el.tagName) return;
+        if (!e.isTrusted || !el || !el.tagName || !el.closest) return;
 
-        // Alt+click marks something to assert on rather than something to press.
+        // Alt+click marks something to assert on rather than something to
+        // press, so the page does not get to act on it.
         if (e.altKey) {
+          e.preventDefault();
+          e.stopPropagation();
           send({ kind: 'assert', selector: selectorFor(el), text: clean(el.innerText || el.value) });
           return;
         }
+
+        if (inSelect2(el)) return;
 
         const tag = el.tagName.toLowerCase();
         const t = String(el.type || '').toLowerCase();
 
         // These report themselves through input/change; a click as well would
         // be noise.
-        if (tag === 'select') return;
-        if (tag === 'textarea') return;
+        if (tag === 'select' || tag === 'option' || tag === 'textarea') return;
         if (tag === 'input' && t !== 'submit' && t !== 'button' && t !== 'reset' && t !== 'image') return;
         if (el.isContentEditable) return;
 
-        // Picking a suggestion is choosing data; pressing a button is not.
-        const inResults = el.closest && el.closest(
-          '[role="listbox"], [role="option"], .select2-results, .tt-menu, ' +
-          'ul.ui-autocomplete, .autocomplete-items, .dropdown-menu');
+        let target = el.closest(CLICKABLE);
+
+        // A label passes the click to its field, and the field reports it.
+        if (target && target.tagName === 'LABEL') return;
+
+        const inResults = !!el.closest(RESULTS) ||
+                          (!!el.closest('.dropdown-menu') && Date.now() - lastTyped < 15000);
+        const appeared = isFresh(el);
+        fresh = null;
+
+        if (!target) {
+          const handCursor = getComputedStyle(el).cursor === 'pointer';
+          if (!handCursor && !inResults && !appeared && stray(el)) return;
+          target = el;
+        }
+
+        const text = clean(target.innerText || target.value);
+        const isButton = target.matches(
+          'button, [type="submit"], input[type="button"], input[type="reset"], [role="button"]');
 
         send({
           kind: 'click',
-          selector: selectorFor(el),
-          label: clean(el.innerText || el.value || el.getAttribute('aria-label') || el.title || tag),
-          text: clean(el.innerText || el.value),
-          pick: !!inResults
+          selector: selectorFor(target),
+          label: text.slice(0, 60) ||
+                 clean(target.getAttribute('aria-label') || target.title || target.getAttribute('alt') ||
+                       target.tagName.toLowerCase()),
+          text: text,
+          // Picking a suggestion is choosing data; pressing a button is not.
+          pick: inResults || (appeared && !isButton),
+          button: isButton
         });
       }, true);
 
@@ -511,13 +782,28 @@ internal sealed class RecordingSession : IAsyncDisposable
         // Esc ends the recording, so it is never recorded as a keypress.
         if (e.key === 'Escape') { send({ kind: 'stop' }); return; }
 
-        if (e.key !== 'Enter') return;
         const el = e.target;
-        if (!el || !el.tagName) return;
-        const tag = el.tagName.toLowerCase();
-        if (tag !== 'input' && tag !== 'textarea') return;
+        if (!e.isTrusted || !el || !el.tagName) return;
 
-        send({ kind: 'press', selector: selectorFor(el), label: labelFor(el), value: 'Enter' });
+        if (inSelect2(el)) {
+          if (e.key === 'Enter') {
+            const lit = document.querySelector('.select2-results__option--highlighted');
+            if (lit) select2Chosen(clean(lit.innerText));
+          }
+          return;
+        }
+
+        // Enter submits or accepts a suggestion; the arrows walk a suggestion
+        // list. Inside a textarea Enter is just part of the text.
+        if (el.tagName.toLowerCase() !== 'input') return;
+
+        const t = String(el.type || 'text').toLowerCase();
+        const arrows = (e.key === 'ArrowDown' || e.key === 'ArrowUp') &&
+                       (t === 'text' || t === 'search' || t === 'email' || t === 'tel' || t === 'url');
+
+        if (e.key !== 'Enter' && !arrows) return;
+
+        send({ kind: 'press', selector: selectorFor(el), label: labelFor(el), value: e.key });
       }, true);
 
       // ---- a word about Esc ---------------------------------------------

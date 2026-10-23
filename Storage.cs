@@ -52,34 +52,136 @@ internal static class Storage
         }
     }
 
+    /// <summary>
+    /// The projects on disk, by the name they were given. The folder is only a
+    /// filename-safe form of that name, so it is never what gets shown.
+    /// </summary>
     public static IReadOnlyList<string> ListProjects()
     {
         Directory.CreateDirectory(ProjectsDir);
 
         return Directory.GetDirectories(ProjectsDir)
-            .Select(Path.GetFileName)
+            .Select(NameOf)
             .Where(n => !string.IsNullOrWhiteSpace(n))
-            .Select(n => n!)
             .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
+    /// <summary>The name saved in a project folder, falling back to the folder's own name.</summary>
+    private static string NameOf(string dir)
+    {
+        try
+        {
+            var meta = JsonSerializer.Deserialize<ProjectMeta>(
+                File.ReadAllText(Path.Combine(dir, "project.json")), Json);
+
+            if (!string.IsNullOrWhiteSpace(meta?.Name))
+            {
+                return meta.Name.Trim();
+            }
+        }
+        catch (Exception)
+        {
+            // No readable project.json: the folder name is the best there is.
+        }
+
+        return Path.GetFileName(dir) ?? "";
+    }
+
+    /// <summary>
+    /// The folder a project lives in. An existing project is found by its saved
+    /// name first, so a folder that does not match the name still opens.
+    /// </summary>
+    private static string DirFor(string name)
+    {
+        Directory.CreateDirectory(ProjectsDir);
+
+        var existing = Directory.GetDirectories(ProjectsDir)
+            .FirstOrDefault(d => string.Equals(NameOf(d), name, StringComparison.OrdinalIgnoreCase));
+
+        return existing ?? Path.Combine(ProjectsDir, Slug(name));
+    }
+
+    /// <summary>True when a project with this name, or one that would share its folder, exists.</summary>
+    public static bool ProjectExists(string name) => Directory.Exists(DirFor(name));
+
     public static ProjectStore OpenProject(string name)
     {
-        var store = new ProjectStore(name, Path.Combine(ProjectsDir, Slug(name)));
+        var store = new ProjectStore(name, DirFor(name));
         store.EnsureFolders();
         return store;
     }
 
     public static void DeleteProject(string name)
     {
-        var dir = Path.Combine(ProjectsDir, Slug(name));
+        var dir = DirFor(name);
 
         if (Directory.Exists(dir))
         {
             Directory.Delete(dir, recursive: true);
         }
     }
+
+    /// <summary>
+    /// Gives a project a new name and moves everything saved under the old one:
+    /// its data folder and its generated C#. Returns the project under its new
+    /// name.
+    /// </summary>
+    public static ProjectStore RenameProject(string oldName, string newName)
+    {
+        var old = OpenProject(oldName);
+        var created = old.CreatedUtc;
+        var newDir = Path.Combine(ProjectsDir, Slug(newName));
+
+        if (!string.Equals(old.Dir, newDir, StringComparison.OrdinalIgnoreCase))
+        {
+            Directory.Move(old.Dir, newDir);
+        }
+
+        var renamed = new ProjectStore(newName, newDir);
+
+        // The generated files carry the old name in their namespace, so they
+        // are written again below rather than moved.
+        if (!string.Equals(old.CodeDir, renamed.CodeDir, StringComparison.OrdinalIgnoreCase) &&
+            Directory.Exists(old.CodeDir))
+        {
+            Directory.Delete(old.CodeDir, recursive: true);
+        }
+
+        renamed.WriteMeta(created);
+        renamed.EnsureFolders();
+
+        var tests = renamed.LoadAll();
+
+        foreach (var test in tests)
+        {
+            // Screenshots and the recording moved along with the folder.
+            test.VideoFile = Moved(test.VideoFile, old.Dir, newDir);
+
+            foreach (var result in test.LastResults.Append(test.LastResult).OfType<TestResult>())
+            {
+                result.ScreenshotPath = Moved(result.ScreenshotPath, old.Dir, newDir);
+            }
+        }
+
+        foreach (var group in tests.GroupBy(t => t.Url))
+        {
+            var file = CodeGen.WriteForLink(renamed, group.Key, group.ToList());
+
+            foreach (var test in group)
+            {
+                test.CodeFile = file;
+                renamed.Save(test);
+            }
+        }
+
+        return renamed;
+    }
+
+    private static string Moved(string path, string oldDir, string newDir) =>
+        path.StartsWith(oldDir, StringComparison.OrdinalIgnoreCase)
+            ? newDir + path[oldDir.Length..]
+            : path;
 
     /// <summary>Filename-safe, human-readable form of a name. Never returns empty.</summary>
     public static string Slug(string text)
@@ -116,6 +218,13 @@ internal static class Storage
     }
 }
 
+/// <summary>What project.json holds: the name the operator gave the project.</summary>
+internal sealed class ProjectMeta
+{
+    public string Name { get; set; } = "";
+    public DateTime CreatedUtc { get; set; }
+}
+
 /// <summary>Reads and writes the test cases and run log of a single project.</summary>
 internal sealed class ProjectStore
 {
@@ -126,8 +235,15 @@ internal sealed class ProjectStore
     public string ScreenshotsDir => Path.Combine(Dir, "screenshots");
     public string VideosDir => Path.Combine(Dir, "videos");
 
-    /// <summary>Default name offered when the operator downloads the workbook.</summary>
-    public string WorkbookName => $"{Storage.Slug(Name)}-tests.xlsx";
+    public string ResultsDir => Path.Combine(Dir, "results");
+
+    /// <summary>Default name offered when the operator downloads the test data.</summary>
+    public string WorkbookName => $"{Storage.Slug(Name)}-test-data.xlsx";
+
+    /// <summary>A fresh results file name; one is written at the end of every run.</summary>
+    public string NewResultsFile() =>
+        Path.Combine(ResultsDir, $"{Storage.Slug(Name)}-results-{DateTime.Now:yyyyMMdd-HHmmss}.xlsx");
+
     public string CodeDir => Path.Combine(Storage.CodeRoot, Storage.Slug(Name));
     private string RunLogFile => Path.Combine(Dir, "runs.json");
     private string MetaFile => Path.Combine(Dir, "project.json");
@@ -143,12 +259,36 @@ internal sealed class ProjectStore
         Directory.CreateDirectory(TestsDir);
         Directory.CreateDirectory(ScreenshotsDir);
         Directory.CreateDirectory(VideosDir);
+        Directory.CreateDirectory(ResultsDir);
         Directory.CreateDirectory(CodeDir);
 
         if (!File.Exists(MetaFile))
         {
-            var meta = new { Name, CreatedUtc = DateTime.UtcNow };
-            File.WriteAllText(MetaFile, JsonSerializer.Serialize(meta, Storage.Json));
+            WriteMeta(DateTime.UtcNow);
+        }
+    }
+
+    public void WriteMeta(DateTime createdUtc)
+    {
+        Directory.CreateDirectory(Dir);
+
+        var meta = new ProjectMeta { Name = Name, CreatedUtc = createdUtc };
+        File.WriteAllText(MetaFile, JsonSerializer.Serialize(meta, Storage.Json));
+    }
+
+    public DateTime CreatedUtc
+    {
+        get
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<ProjectMeta>(File.ReadAllText(MetaFile), Storage.Json)?.CreatedUtc
+                       ?? DateTime.UtcNow;
+            }
+            catch (Exception)
+            {
+                return DateTime.UtcNow;
+            }
         }
     }
 
