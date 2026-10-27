@@ -33,6 +33,8 @@ and uploads it back.
     +-- Download test data  ->  hand it to a tester  ->  they add data rows
     +-- Upload test data    ->  every row runs as its own test
     |
+    +-- Scrape data to Excel    <- read a page's grid, every page of it, to Excel
+    |
     +-- Show all test cases     <- every case, data rows, last status, Run
     +-- Run all test cases      ->  results file, with charts
     +-- Results file            <- the last result of everything, any time
@@ -289,6 +291,42 @@ the data. It produces the same steps and the same test data file. Recording is
 easier for anything with a flow to it; scanning is useful for a page you would
 rather read than act on.
 
+## Scrape mode
+
+**Scrape data to Excel** is the other thing a project does. Where testing drives
+a page, scraping reads one: paste the link, the page opens in a browser, you
+apply whatever filter you want and load the data, then press the green **Scrape
+to Excel** button the tool floats in the top-right corner (Esc cancels).
+
+```
+  Project home
+    |
+    +-- Scrape data to Excel...
+          |
+          +-- "Which page?"            <- popup: the link (+ sign in first)
+          +-- The app HIDES. Browser only. Filter and load the grid you want.
+          +-- Press "Scrape to Excel"  <- the floating button in the page
+          |     Reads every visible table; follows the "Next" page to the end.
+          +-- Save the workbook        <- one sheet per table, the big grid first
+```
+
+What it reads:
+
+- Every visible `<table>` on the page, each to its own sheet. If the page has no
+  real tables it falls back to ARIA grids (`role="grid"`, the kind ag-Grid and
+  the like draw out of `<div>`s).
+- The largest grid is **paginated to the end**: the tool finds the "Next" control
+  (a `rel="next"` link, a `next`/`›`/`»` button, an aria-label or title that says
+  "next", or the class names the common pagination libraries use), clicks it,
+  reads the new rows, and repeats until there is no enabled next page - or a page
+  turns up nothing new. Up to 1000 pages.
+- A cell that holds a form control reports what the control shows (the chosen
+  option, a ticked box as `TRUE`), not a blank.
+
+Every value is written as **text**, so a code like `007` or a date stays exactly
+as the page showed it. The browser is always visible for a scrape - there is
+nothing to filter on a hidden window - whatever the headless setting says.
+
 ## Self test
 
 ```
@@ -302,7 +340,8 @@ events were **not** - and that **Esc stops the recording**, runs it, downloads
 the test data, adds a second row the way a tester would, uploads it, runs both
 rows, confirms a row expecting the wrong thing fails **on its own** and that a
 broken step says which step it was, writes the results file and checks its
-charts, reads back the generated C#, and renames the project. Exit code 0 means
+charts, reads back the generated C#, scrapes a three-page grid and confirms all
+of it came through into a valid workbook, and renames the project. Exit code 0 means
 all checks passed; the log, including the generated fixture, is written to
 `%TEMP%\playwright-test-studio-selftest.log`, and the results file it made is
 left at `%TEMP%\pts-selftest-results.xlsx` to look at.

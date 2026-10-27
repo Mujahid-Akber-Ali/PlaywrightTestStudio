@@ -22,7 +22,7 @@ internal sealed class MainForm : Form
 
         Text = $"{Ui.AppTitle} - {store.Name}";
         Font = Ui.Body;
-        ClientSize = new Size(760, 640);
+        ClientSize = new Size(760, 686);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false;
@@ -33,6 +33,8 @@ internal sealed class MainForm : Form
         _summary = Ui.Hint("", 22, 46, 710);
         Controls.Add(_summary);
 
+        // Testing is what the row of buttons below is for. Scraping data is the
+        // other thing this project can do, so it gets a button of its own.
         var record = Ui.Primary("Record a test case", 20, 84, 350);
         record.Height = 46;
         record.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
@@ -42,47 +44,59 @@ internal sealed class MainForm : Form
         showAll.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
         showAll.BackColor = Color.FromArgb(60, 60, 60);
 
-        var download = Ui.Secondary("Download test data (Excel)", 20, 144, 350);
-        var upload = Ui.Secondary("Upload test data and run", 380, 144, 350);
+        var scrape = Ui.Primary("Scrape data to Excel (walks every page)...", 20, 138, 710);
+        scrape.Height = 42;
+        scrape.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
+        scrape.BackColor = Ui.Pass;
 
-        var runAll = Ui.Secondary("Run all test cases", 20, 182, 226);
-        var results = Ui.Secondary("Results file (with charts)", 254, 182, 226);
-        var scan = Ui.Secondary("Scan a page instead...", 488, 182, 242);
+        var download = Ui.Secondary("Download test data (Excel)", 20, 192, 350);
+        var upload = Ui.Secondary("Upload test data and run", 380, 192, 350);
 
-        var signIn = Ui.Secondary("Sign in to a site...", 20, 220, 350);
-        var perf = Ui.Secondary("Performance metrics (Excel)...", 380, 220, 350);
+        var runAll = Ui.Secondary("Run all test cases", 20, 230, 226);
+        var results = Ui.Secondary("Results file (with charts)", 254, 230, 226);
+        var scan = Ui.Secondary("Scan a page instead...", 488, 230, 242);
+
+        var signIn = Ui.Secondary("Sign in to a site...", 20, 268, 350);
+        var perf = Ui.Secondary("Performance metrics (Excel)...", 380, 268, 350);
 
         var headless = new CheckBox
         {
-            Text = "Run the browser hidden (headless). Recording is always visible.",
+            Text = "Run the browser hidden (headless). Recording and scraping are always visible.",
             Font = Ui.Body,
             AutoSize = true,
             Checked = AppSettings.Headless,
-            Location = new Point(22, 266)
+            Location = new Point(22, 314)
         };
 
-        var recentLabel = Ui.Hint("Recent runs", 20, 296);
+        var recentLabel = Ui.Hint("Recent runs", 20, 342);
         recentLabel.Font = Ui.Bold;
         recentLabel.ForeColor = SystemColors.ControlText;
 
         _recent = new ListBox
         {
             Font = Ui.Mono,
-            Location = new Point(20, 318),
+            Location = new Point(20, 364),
             Size = new Size(710, 236),
             IntegralHeight = false
         };
 
-        var switchProject = Ui.Secondary("Switch project", 20, 568, 150);
-        var codeFolder = Ui.Secondary("Generated C#", 178, 568, 150);
-        var dataFolder = Ui.Secondary("Data folder", 336, 568, 130);
-        var quit = Ui.Secondary("Quit", 630, 568, 100);
+        var switchProject = Ui.Secondary("Switch project", 20, 614, 150);
+        var codeFolder = Ui.Secondary("Generated C#", 178, 614, 150);
+        var dataFolder = Ui.Secondary("Data folder", 336, 614, 130);
+        var quit = Ui.Secondary("Quit", 630, 614, 100);
 
         record.Click += async (_, _) =>
         {
             // Async so the window can hide and the message loop keeps running
             // while the recording is in progress.
             await RecordDialogs.RecordAsync(this, _store);
+            RefreshView();
+        };
+        scrape.Click += async (_, _) =>
+        {
+            // Async so the window can hide and the message loop keeps running
+            // while the operator sets the page up and the scrape runs.
+            await ScrapeDialogs.ScrapeAsync(this, _store);
             RefreshView();
         };
         showAll.Click += (_, _) => { TestCaseDialogs.ShowAll(this, _store); RefreshView(); };
@@ -136,7 +150,7 @@ internal sealed class MainForm : Form
 
         Controls.AddRange(new Control[]
         {
-            record, showAll, download, upload, runAll, results, scan, signIn, perf, headless,
+            record, showAll, scrape, download, upload, runAll, results, scan, signIn, perf, headless,
             recentLabel, _recent, switchProject, codeFolder, dataFolder, quit
         });
 

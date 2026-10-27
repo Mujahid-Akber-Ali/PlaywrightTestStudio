@@ -411,6 +411,61 @@ internal static class SelfTest
                 !Directory.Exists(store.CodeDir),
                 moved.Count == 1 ? moved[0].CodeFile : $"{moved.Count} test case(s)");
 
+            // ---------------------------------------------------------------
+            // Scraping: open a paginated grid and pull every page into Excel.
+            // ---------------------------------------------------------------
+            var scrapePage = WriteScrapeSamplePage();
+            var scrapeUrl = new Uri(scrapePage).AbsoluteUri;
+            var scrapeFile = Path.Combine(Path.GetTempPath(), "pts-selftest-scrape.xlsx");
+
+            var scrape = ScrapeHeadlessAsync(scrapeUrl, log).GetAwaiter().GetResult();
+            var grid = scrape.Tables.OrderByDescending(t => t.Cells).FirstOrDefault();
+
+            log.AppendLine($"Scraped     : {scrape.Pages} page(s), {scrape.RowCount} row(s), {scrape.Tables.Count} table(s)");
+
+            Check("the paginated grid was walked to the last page", scrape.Pages == 3, $"{scrape.Pages} page(s)");
+            Check("every row across every page was collected",
+                grid is not null && grid.Rows.Count == 25, $"{grid?.Rows.Count ?? 0} row(s)");
+            Check("the column headings were read",
+                grid is not null && grid.Headers.SequenceEqual(new[] { "Code", "Name", "Qty" }),
+                grid is null ? "no grid" : string.Join(", ", grid.Headers));
+            Check("the first and last rows are the real first and last, in order",
+                grid is not null && grid.Rows.Count == 25 &&
+                grid.Rows[0].SequenceEqual(new[] { "C1", "Item 1", "2" }) &&
+                grid.Rows[24].SequenceEqual(new[] { "C25", "Item 25", "50" }),
+                grid is null || grid.Rows.Count == 0 ? "no rows" : string.Join(" | ", grid.Rows[0]));
+            Check("a second table on the page became a second table",
+                scrape.Tables.Count == 2, $"{scrape.Tables.Count} table(s)");
+
+            var scrapeSheets = ScrapeBook.Write(scrape, scrapeFile);
+            Check("the scrape workbook has a sheet per table", scrapeSheets == 2, $"{scrapeSheets} sheet(s)");
+
+            using (var document = SpreadsheetDocument.Open(scrapeFile, false))
+            {
+                var faults = new OpenXmlValidator().Validate(document).Take(10).ToList();
+
+                foreach (var fault in faults)
+                {
+                    log.AppendLine($"              invalid: {fault.Path?.XPath} - {fault.Description}");
+                }
+
+                Check("the scrape workbook is a valid .xlsx", faults.Count == 0, $"{faults.Count} fault(s)");
+            }
+
+            using (var book = new XLWorkbook(scrapeFile))
+            {
+                var ws = book.Worksheets.First();
+                var lastRow = ws.LastRowUsed()?.RowNumber() ?? 0;
+
+                Check("the sheet holds the header plus all 25 rows", lastRow == 26, $"last row {lastRow}");
+                Check("a numeric-looking code is kept as text, not a number",
+                    ws.Cell(2, 1).GetString() == "C1" && ws.Cell(26, 1).GetString() == "C25",
+                    $"{ws.Cell(2, 1).GetString()} .. {ws.Cell(26, 1).GetString()}");
+            }
+
+            File.Delete(scrapePage);
+            File.Delete(scrapeFile);
+
             // Cleanup. The results file is left behind on purpose, to be looked at.
             Storage.DeleteProject(renamedTo);
 
@@ -499,6 +554,78 @@ internal static class SelfTest
         }
 
         return (await session.StopAsync("Submit the sample form"), stopped);
+    }
+
+    /// <summary>
+    /// Opens the scrape sample hidden, asks it to scrape straight away (the
+    /// floating button is what a person would press), and returns what came back.
+    /// </summary>
+    private static async Task<ScrapeResult> ScrapeHeadlessAsync(string url, StringBuilder log)
+    {
+        await using var session = await ScrapeSession.StartAsync(url, headless: true);
+        var result = await session.ScrapeAsync(line => log.AppendLine($"              {line}"));
+        return result;
+    }
+
+    /// <summary>
+    /// A page with a three-page, twenty-five row grid behind a Next button, plus
+    /// a small second table, to prove pagination is followed and every table is
+    /// taken.
+    /// </summary>
+    private static string WriteScrapeSamplePage()
+    {
+        var file = Path.Combine(Path.GetTempPath(), "pts-selftest-scrape.html");
+
+        File.WriteAllText(file, """
+        <!doctype html>
+        <html>
+        <head><meta charset="utf-8"><title>Sample grid</title></head>
+        <body>
+          <h1>Indents</h1>
+          <table id="grid">
+            <thead><tr><th>Code</th><th>Name</th><th>Qty</th></tr></thead>
+            <tbody id="body"></tbody>
+          </table>
+          <nav><button id="next" type="button">Next &rsaquo;</button></nav>
+
+          <h2>Summary</h2>
+          <table id="summary">
+            <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td>Total</td><td>25</td></tr>
+              <tr><td>Open</td><td>9</td></tr>
+            </tbody>
+          </table>
+
+          <script>
+            var data = [];
+            for (var i = 1; i <= 25; i++) { data.push(['C' + i, 'Item ' + i, String(i * 2)]); }
+
+            var pageSize = 10;
+            var page = 0;
+
+            function render() {
+              var body = document.getElementById('body');
+              body.innerHTML = '';
+              data.slice(page * pageSize, page * pageSize + pageSize).forEach(function (r) {
+                var tr = document.createElement('tr');
+                r.forEach(function (v) { var td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+                body.appendChild(tr);
+              });
+              document.getElementById('next').disabled = (page + 1) * pageSize >= data.length;
+            }
+
+            document.getElementById('next').addEventListener('click', function () {
+              if ((page + 1) * pageSize < data.length) { page++; render(); }
+            });
+
+            render();
+          </script>
+        </body>
+        </html>
+        """);
+
+        return file;
     }
 
     /// <summary>

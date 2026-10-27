@@ -239,18 +239,24 @@ internal static class ProjectDialogs
     public static string? AskLink(IWin32Window owner, string? suggested = null, string purpose = "scan")
     {
         var recording = purpose == "record";
+        var scraping = purpose == "scrape";
 
         using var form = Ui.NewForm($"{Ui.AppTitle} - Link", 560, 276);
 
         form.Controls.Add(Ui.Title(recording
             ? "Which page do you want to record on?"
-            : "Which page do you want to test?"));
+            : scraping
+                ? "Which page do you want to scrape?"
+                : "Which page do you want to test?"));
 
         form.Controls.Add(Ui.Hint(recording
             ? "Paste the full link. The page opens in a browser and everything you do there is recorded " +
               "as a test case."
-            : "Paste the full link. The tool opens it and lists every dropdown, " +
-              "text field, radio button and button it finds.", 22, 46, 500));
+            : scraping
+                ? "Paste the full link. The page opens in a browser; apply any filter and load the data, " +
+                  "then press \"Scrape to Excel\" to pull every row - across every page - into a workbook."
+                : "Paste the full link. The tool opens it and lists every dropdown, " +
+                  "text field, radio button and button it finds.", 22, 46, 500));
 
         var input = new TextBox
         {
@@ -265,7 +271,7 @@ internal static class ProjectDialogs
             "scan and every later run stay signed in.", 22, 136, 500);
 
         var login = Ui.Secondary("Sign in first...", 20, 186, 130);
-        var scan = Ui.Primary(recording ? "Start recording" : "Scan page", 276, 186, 140);
+        var scan = Ui.Primary(recording ? "Start recording" : scraping ? "Open page" : "Scan page", 276, 186, 140);
         var cancel = Ui.Secondary("Cancel", 424, 186, 112);
 
         login.Click += (_, _) =>
